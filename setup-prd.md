@@ -2,7 +2,7 @@
 
 **Author:** Generated for Vitor Monteiro · **Date:** March 2026
 **Note:** All references to the admin user are "Vitor" throughout.
-**Stack:** OpenClaw + LiteLLM + Citadel Guard + Playwright, alongside Pi-hole & Plex
+**Stack:** OpenClaw + LiteLLM + Citadel Guard + Playwright, co-located on the existing `192.168.0.3` Docker host alongside Pi-hole, Plex, the Arr stack, SABnzbd, Gluetun tooling, and Prometheus/Grafana. This target state assumes qBittorrent is retired from the server.
 **Estimated monthly cost:** £5–15 (Anthropic API) + £1 (Zoho Mail)
 
 ---
@@ -36,6 +36,8 @@ OpenClaw is a 250,000+ star open-source AI agent framework. It runs a **Gateway*
 
 The key security insight: OpenClaw has broad system access by design. Every layer of defence matters because **a single prompt injection in an email could instruct the agent to exfiltrate data**. This guide treats security as a first-class concern, not an afterthought.
 
+This deployment is **not** greenfield. The Dell mini PC at `192.168.0.3` already serves Pi-hole/DNS, Plex, media automation, and monitoring. As of March 17, 2026, the only confirmed manual WAN port forward is `32400/TCP -> 192.168.0.3:32400` for Plex. OpenClaw should add **zero** new Virgin router forwards, should not use `host` networking, and should not be attached to the existing `media` or `vpn` networks.
+
 ### High-Level Data Flow
 
 ```
@@ -68,53 +70,55 @@ The key architectural decision here is a **Hybrid Security Approach**:
 
 ## 2. Docker Compose Stack
 
-Network isolation is critical. OpenClaw sits on `agent-net`, Pi-hole on `pihole-net`, Plex on host networking. These cannot communicate unless explicitly bridged.
+This host already has working `media`, `vpn`, and `monitoring` bridge networks. Do **not** replace that layout. OpenClaw should be added as a small, isolated overlay inside the existing compose project.
+
+### Host Rules For This Box
+
+1. Keep the existing `media`, `vpn`, and `monitoring` networks unchanged.
+2. Add a dedicated `agent` network for OpenClaw-related services and a tiny `egress` network used only by the outbound proxy.
+3. Bind every OpenClaw host port to `127.0.0.1` only.
+4. Do not add Watchtower labels to the OpenClaw services yet. Your Watchtower config is label-gated, and OpenClaw has a known config-write bug that makes manual upgrades safer.
+5. Do not create any new Virgin router forwards for OpenClaw. If you ever need inbound webhooks later, use a Cloudflare Tunnel rather than the router.
+
+Your current compose already consumes host ports such as `3000`, `8000`, `8081`, `8082`, `8083`, `8085`, `8191`, `8888`, `8989`, `9090`, `9093`, `9100`, `9696`, and `32400`. The OpenClaw ports below (`18789`, `3007`, and optional localhost-only `4000`) do not collide with that layout.
+
+### Additive Compose Overlay
+
+Add the following services and networks to the **existing** compose file rather than replacing the media stack:
 
 ```yaml
-version: "3.9"
-
 services:
-  # ════════════════ OpenClaw Gateway ════════════════
   openclaw:
     image: alpine/openclaw:latest
     container_name: openclaw
-    user: "1000:1000"
+    user: "${PUID}:${PGID}"
     read_only: true
     security_opt:
       - no-new-privileges:true
-    cap_drop:
-      - ALL
-    networks:
-      - agent-net
-    ports:
-      - "127.0.0.1:18789:18789"   # Gateway — localhost only
-      - "127.0.0.1:3007:3007"     # WebChat UI — localhost only
+    cap_drop: [ALL]
     tmpfs:
       - /tmp:noexec,nosuid,size=200m
-    volumes:
-      - openclaw-data:/home/node/.openclaw
-      - openclaw-workspace:/home/node/workspace
-      - openclaw-skills:/home/node/.openclaw/skills
-      # Secrets injected via env, NOT mounted as files (see Section 6)
     env_file:
-      - ./secrets/openclaw.env    # Contains ${VAR} references only
+      - ./secrets/openclaw.env
     environment:
       - NODE_ENV=production
-      - TZ=Europe/London
-    healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:18789/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 2G
-        reservations:
-          cpus: '0.5'
-          memory: 512M
+      - TZ=${TZ}
+      - HTTP_PROXY=http://proxy:3128
+      - HTTPS_PROXY=http://proxy:3128
+      - NO_PROXY=localhost,127.0.0.1,litellm,citadel,openshell,browser,proxy
+    ports:
+      - "127.0.0.1:18789:18789"
+      - "127.0.0.1:3007:3007"
+    volumes:
+      - ./config/openclaw:/home/node/.openclaw
+      - ./workspace/openclaw:/home/node/workspace
+    networks: [agent]
+    depends_on:
+      - litellm
+      - citadel
+      - openshell
+      - browser
+      - proxy
     restart: unless-stopped
     logging:
       driver: json-file
@@ -122,123 +126,94 @@ services:
         max-size: "10m"
         max-file: "5"
 
-  # ════════════════ LiteLLM Proxy ════════════════
   litellm:
     image: docker.litellm.ai/berriai/litellm:main-stable
     container_name: litellm
-    networks:
-      - agent-net
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    env_file:
+      - ./secrets/litellm.env
+    environment:
+      - TZ=${TZ}
+      - HTTP_PROXY=http://proxy:3128
+      - HTTPS_PROXY=http://proxy:3128
+      - NO_PROXY=localhost,127.0.0.1,openclaw,citadel,openshell,browser,proxy
     ports:
       - "127.0.0.1:4000:4000"
     volumes:
-      - ./config/litellm_config.yaml:/app/config.yaml:ro
-    env_file:
-      - ./secrets/litellm.env
-    command: ["--config", "/app/config.yaml"]
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 512M
+      - ./config/litellm/config.yaml:/app/config.yaml:ro
+    networks: [agent]
     restart: unless-stopped
 
-  # ════════════════ NVIDIA OpenShell Daemon ════════════════
   openshell:
     image: ghcr.io/nvidia/openshell:latest
     container_name: openshell
-    networks:
-      - agent-net
-    ports:
-      - "127.0.0.1:50051:50051"   # GRPC endpoint for OpenClaw
-    volumes:
-      - ./config/openshell_policies.yaml:/etc/openshell/policies.yaml:ro
-      - openclaw-workspace:/mnt/workspace
     security_opt:
       - apparmor:unconfined
     cap_add:
-      - SYS_ADMIN # Required for OpenShell to create sub-sandboxes via bubblewrap/namespaces
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 1G
+      - SYS_ADMIN
+    volumes:
+      - ./config/openshell/policies.yaml:/etc/openshell/policies.yaml:ro
+      - ./workspace/openclaw:/mnt/workspace
+    expose:
+      - "50051"
+    networks: [agent]
     restart: unless-stopped
 
-  # ════════════════ Citadel Guard (LLM Firewall) ════════════════
   citadel:
     image: ghcr.io/trymightyai/citadel:latest
     container_name: citadel
-    networks:
-      - agent-net
-    ports:
-      - "127.0.0.1:3333:3333"
+    command: ["--port", "3333"]
     environment:
       - CITADEL_AUTO_DOWNLOAD_MODEL=true
       - CITADEL_ENABLE_HUGOT=true
-    command: ["--port", "3333"]
+      - HTTP_PROXY=http://proxy:3128
+      - HTTPS_PROXY=http://proxy:3128
+      - NO_PROXY=localhost,127.0.0.1,openclaw,litellm,openshell,browser,proxy
     volumes:
-      - citadel-models:/root/.cache/huggingface  # Cache the 685MB BERT model
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 1G
+      - ./config/citadel-cache:/root/.cache/huggingface
+    expose:
+      - "3333"
+    networks: [agent]
     restart: unless-stopped
 
-  # ════════════════ Playwright Browser Server ════════════════
   browser:
     image: mcr.microsoft.com/playwright:v1.58.2-noble
     container_name: openclaw-browser
-    networks:
-      - agent-net
     command: npx playwright run-server --port 3000 --host 0.0.0.0
     shm_size: "1g"
-    deploy:
-      resources:
-        limits:
-          cpus: '1.5'
-          memory: 2G
+    networks: [agent]
     restart: unless-stopped
 
-  # ════════════════ Egress Proxy (Squid) ════════════════
   proxy:
     image: ubuntu/squid:latest
-    container_name: egress-proxy
-    networks:
-      - agent-net
+    container_name: openclaw-egress-proxy
     volumes:
       - ./config/squid.conf:/etc/squid/squid.conf:ro
+    networks:
+      - agent
+      - egress
     restart: unless-stopped
 
-  # ════════════════ Existing Services ════════════════
-  pihole:
-    image: pihole/pihole:latest
-    networks:
-      - pihole-net
-    # ... your existing Pi-hole config
-
-  plex:
-    image: lscr.io/linuxserver/plex:latest
-    network_mode: host
-    # ... your existing Plex config
-
 networks:
-  agent-net:
+  media:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.25.0.0/24
-  pihole-net:
+  vpn:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.26.0.0/24
+  monitoring:
+    driver: bridge
+  agent:
+    driver: bridge
+    internal: true
+  egress:
+    driver: bridge
+```
 
-volumes:
-  openclaw-data:
-  openclaw-workspace:
-  openclaw-skills:
-  citadel-models:
+### Safe Access Pattern
+
+Because the OpenClaw UI and gateway are bound to localhost only, access them over SSH from your laptop instead of exposing them on the LAN:
+
+```bash
+ssh -L 3007:127.0.0.1:3007 -L 18789:127.0.0.1:18789 vitor@192.168.0.3
 ```
 
 ### Running Onboard on a Headless Box
@@ -255,10 +230,12 @@ docker compose up -d
 
 ### systemd Auto-Start Service
 
+If your current media stack already boots through a systemd unit, extend that existing unit for the combined compose file. Do **not** create a second competing service against the same project directory.
+
 ```ini
 # /etc/systemd/system/homelab.service
 [Unit]
-Description=Homelab Docker Compose Stack
+Description=Combined Homelab Docker Compose Stack
 Requires=docker.service
 After=docker.service network-online.target
 
@@ -626,11 +603,13 @@ Never mount your entire `.env` file or host environment. Inject only the specifi
 
 #### Layer D: Outbound Network Filtering
 
-Do not use host-level `iptables` rules for container network isolation, as Docker routinely overwrites or bypasses them. Instead, utilize the dedicated egress proxy container configuration (`squid`).
+Do not use host-level `iptables` rules for container network isolation, as Docker routinely overwrites or bypasses them. Instead, use the dedicated egress proxy container (`squid`) plus Docker network boundaries.
 
-1. Route the OpenClaw container's outbound HTTP/HTTPS traffic exclusively through the proxy by specifying `HTTP_PROXY=http://proxy:3128` and `HTTPS_PROXY=http://proxy:3128` in OpenClaw's environment config.
-2. In `squid.conf`, whitelist only the essential domain names (e.g., `api.anthropic.com`, `generativelanguage.googleapis.com`, `zoho.com`, `api.github.com`, `graph.facebook.com`).
-3. (Optional) Force the `agent-net` Docker network to `internal: true` to prevent direct internet access completely, forcing all egress through the proxy.
+1. Keep `openclaw`, `litellm`, `citadel`, `openshell`, and `browser` on the isolated `agent` network only.
+2. Put only the `proxy` container on both `agent` and `egress`.
+3. Route outbound HTTP/HTTPS traffic through the proxy by setting `HTTP_PROXY=http://proxy:3128` and `HTTPS_PROXY=http://proxy:3128` in the relevant containers.
+4. In `squid.conf`, whitelist only the essential domain names (e.g., `api.anthropic.com`, `generativelanguage.googleapis.com`, `zoho.com`, `api.github.com`, `graph.facebook.com`).
+5. Keep `agent` marked `internal: true` so OpenClaw does not accidentally gain direct internet access or lateral reach into `media` or `vpn`.
 
 This prevents a compromised agent from exfiltrating data to arbitrary external servers. Even if an injection tells the agent to send data to `evil.com`, the network layer blocks it.
 
@@ -878,7 +857,7 @@ with open('token_vitor.json', 'w') as f:
 
 ---
 
-## 11. Event-Driven Webhooks & Heartbeats
+## 12. Event-Driven Webhooks & Heartbeats
 
 OpenClaw's heartbeat runs periodically (e.g. every 2 hours) to handle scheduled tasks. However, for immediate responsiveness without burning API credits through constant polling, use real-time webhooks.
 
@@ -912,7 +891,7 @@ Use Playwright in the browser container to scrape product pages on a cron schedu
 
 ---
 
-## 12. Browser Automation
+## 13. Browser Automation
 
 OpenClaw connects to the Playwright server container via Chrome DevTools Protocol on `http://browser:3000`.
 
@@ -924,7 +903,7 @@ Key considerations for your mini PC:
 
 ---
 
-## 13. GitHub / Dev Workflow Integration
+## 14. GitHub / Dev Workflow Integration
 
 Use a **fine-grained Personal Access Token** with read-only access to specific repos.
 
@@ -934,7 +913,7 @@ For real-time webhooks, set up a **Cloudflare Tunnel** (free) to expose a webhoo
 
 ---
 
-## 14. Voice Support (Optional)
+## 15. Voice Support (Optional)
 
 For a headless Docker setup, voice works through Telegram and WhatsApp voice messages:
 
@@ -947,7 +926,7 @@ On 8 GB systems, skip these and fall back to cloud APIs for voice.
 
 ---
 
-## 15. Persona & SOUL.md Configuration
+## 16. Persona & SOUL.md Configuration
 
 ```markdown
 # SOUL.md — Personal Assistant Persona
@@ -999,55 +978,48 @@ and household tasks. You are a real person — a remote PA based in the UK.
 
 ---
 
-## 16. Deployment Sequence (Step by Step)
+## 17. Deployment Sequence (Step by Step)
 
-### Phase 0: Install Code Claude (Your AI Co-Pilot)
+### Phase 0: Baseline The Existing Host
 
-Before doing anything else, install **Code Claude** (by Anthropic) on the host machine. You can use it to completely automate the rest of this setup, from generating the Docker files to writing the SOPS configs.
+1. **Back up the current stack:** Save the current compose file and the `./config` tree from `192.168.0.3` before merging anything.
+2. **Remove qBittorrent from the target state:** This guide assumes it is retired rather than carried forward beside OpenClaw.
+3. **Lock down router expectations:** Keep OpenClaw at zero WAN forwards. The only intentional external exposure on this host should remain Plex `32400/TCP` if you explicitly decide to keep it.
+4. **Create new paths:** Prepare `./config/openclaw`, `./config/litellm`, `./config/openshell`, `./config/citadel-cache`, `./workspace/openclaw`, and `./secrets`.
 
-1. **Install Node.js (if not present):** `curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt-get install -y nodejs`
-2. **Install Code Claude:** `npm install -g @anthropic-ai/code-claude`
-3. **Authenticate:** Run `code-claude auth` and provide your Anthropic API Key.
-4. **Initialize:** Run `code-claude init /opt/homelab` to let the agent take over the workspace.
+### Phase 1: Merge The Agent Stack Into The Existing Compose Project
 
-*From this point forward, you can literally pass this Markdown guide to Code Claude and ask it to "Execute Phase 1 and onwards based on these instructions."*
+5. **Add the new services and networks:** Merge `openclaw`, `litellm`, `openshell`, `citadel`, `browser`, `proxy`, `agent`, and `egress` into the existing compose file.
+6. **Leave the existing media services alone:** Do not move Plex, Pi-hole, Sonarr, Radarr, Bazarr, SABnzbd, Gluetun, or the monitoring stack onto the new networks.
+7. **Keep all new bindings localhost-only:** `18789`, `3007`, and optional `4000` should stay on `127.0.0.1`.
+8. **Do not enable Watchtower for the new services yet:** Upgrade OpenClaw manually until the config-write bug and your post-update secret checks are under control.
 
-### Phase 1: Host Preparation & Security
+### Phase 2: Secrets And External Dependencies
 
-1. **Prepare the host:** Instruct Code Claude to install Docker + Docker Compose on Ubuntu, and setup the `/opt/homelab/` directory.
-2. **Set up secrets:** Generate age keys, create encrypted secrets with SOPS. Store the age key OUTSIDE the server (USB stick or password manager).
-3. **Configure DNS:** Add MX, SPF, DKIM, DMARC records for bitoiu.net. Start DMARC in `p=none`, tighten to `p=reject` after 2 weeks.
+9. **Set up secrets:** Generate age keys, create encrypted secrets with SOPS, and keep the age key outside the server.
+10. **Set up email:** Create `assistant@bitoiu.net` on Zoho Mail.
+11. **Run OAuth consent flows:** On your laptop, run the Python script and copy the token file into the secrets volume.
+12. **Set up Family WhatsApp:** Register the WhatsApp Cloud API in the Meta Developer portal.
+13. **Set up Admin Telegram bots:** Use `@BotFather` to create your specialized bots and find your user ID via `@userinfobot`.
 
-### Phase 2: External Dependencies
+### Phase 3: Deployment And Hardening
 
-4. **Set up email:** Create `assistant@bitoiu.net` on Zoho Mail.
-5. **Run OAuth consent flows:** On your laptop, run the Python script. Copy token file to the secrets volume.
-6. **Set up Family WhatsApp:** Order a giffgaff SIM, register the WhatsApp Cloud API in the Meta Developer portal.
-7. **Set up Admin Telegram Bots:** Speak to `@BotFather` on Telegram to create your specialized bots (PA, Dev) and get the HTTP API tokens. Find your User ID via `@userinfobot`.
-
-### Phase 3: Deployment & Configuration
-
-8. **Deploy the stack:** `docker compose up -d`. Run onboarding via `docker compose exec openclaw openclaw onboard`.
-
-8. **Install security skills & configs:**
-   - Configure `openclaw.json` to route execution through the OpenShell gRPC endpoint.
-   - Install `clawhub install clawsec-suite`
-
-9. **Vet and install functional skills:** Use skill-vetter before every install. Start with official/high-star skills only.
-
-10. **Configure SOUL.md, HEARTBEAT.md, TOOLS.md:** Copy from templates above.
-
-11. **Set up Citadel Guard plugin:** Clone, install, configure in openclaw.json.
-
-12. **Configure egress proxy:** Verify the Squid proxy is running and OpenClaw is configured to pass HTTP/HTTPS traffic through it.
-
-14. **Enable systemd service:** `sudo systemctl enable --now homelab.service`.
-
-15. **Test everything:** Send a Telegram message. Send a WhatsApp message from your and Sophonn's phone. Request an email draft and verify it appears in your Gmail without sending. Verify Calendar event creation. Check Citadel logs for scan activity. Send a test injection to verify it's caught.
+14. **Start the agent slice:** `docker compose up -d proxy litellm openshell citadel browser openclaw`
+15. **Run onboarding:** `docker compose run --rm openclaw openclaw onboard --install-daemon`
+16. **Wire up the security layers:**
+    - Configure `openclaw.json` to use the OpenShell gRPC endpoint.
+    - Install `clawhub install clawsec-suite`
+    - Clone and configure the Citadel Guard plugin
+17. **Configure SOUL.md, HEARTBEAT.md, TOOLS.md:** Apply the templates above.
+18. **Validate proxy enforcement:** Confirm model calls and browser automation work through Squid before you trust the setup.
+19. **Reuse the existing systemd wrapper:** If the current homelab stack already starts via systemd, keep one combined service for the single compose project.
+20. **Test the full flow:** Send a Telegram message, a WhatsApp message, and a Gmail draft request. Verify Calendar writes, Citadel scans, and a blocked test injection.
 
 ---
 
-## 17. RAM Budget & Hardware Requirements
+## 18. RAM Budget & Hardware Requirements
+
+### Incremental OpenClaw Load
 
 | Component | RAM (Idle) | RAM (Peak) |
 |-----------|-----------|-----------|
@@ -1056,13 +1028,27 @@ Before doing anything else, install **Code Claude** (by Anthropic) on the host m
 | Citadel Guard (BERT) | 700 MB | 900 MB |
 | NVIDIA OpenShell | 200 MB | 500 MB |
 | Playwright Browser | 300 MB | 1.5 GB |
-| Pi-hole + Unbound | 100 MB | 200 MB |
-| Plex | 500 MB | 2 GB |
-| OS + Docker overhead | 500 MB | 800 MB |
-| **Total** | **~2.5 GB** | **~6.5 GB** |
+| Squid proxy | 50 MB | 100 MB |
+| **OpenClaw subtotal** | **~1.7 GB** | **~4.1 GB** |
 
-A **16 GB** mini PC handles this comfortably with room for voice containers.
-An **8 GB** box works if you skip voice and keep browser automation light.
+### Existing Host Load (Approximate, Without qBittorrent)
+
+| Component Group | RAM (Idle) | RAM (Peak) |
+|----------------|-----------|-----------|
+| Plex + Pi-hole | 600 MB | 2.2 GB |
+| Arr / Usenet / VPN services | 800 MB | 1.8 GB |
+| Monitoring + dashboard + Watchtower | 400 MB | 1.0 GB |
+| OS + Docker overhead | 500 MB | 800 MB |
+| **Existing subtotal** | **~2.3 GB** | **~5.8 GB** |
+
+### Combined Target Box
+
+| Total | RAM (Idle) | RAM (Peak) |
+|------|-----------|-----------|
+| Existing stack + OpenClaw | ~4.0 GB | ~9.9 GB |
+
+A **16 GB** mini PC is the comfortable target for this combined workload.
+An **8 GB** box is no longer ideal once Plex, monitoring, and Playwright all coexist, especially if Plex ever transcodes.
 
 ---
 
@@ -1074,6 +1060,7 @@ An **8 GB** box works if you skip voice and keep browser automation light.
 | Malicious ClawHub skills | NVIDIA OpenShell runtime OS network/file sandboxing | Sandbox escapes (highly rare but possible) |
 | Credential exfiltration at runtime | Scoped env vars + egress filtering + no secrets in context window | A compromised process can still read its own env |
 | SOUL.md / memory poisoning | ClawSec soul-guardian + regular integrity checks | Requires ClawSec to be running |
+| Accidental WAN exposure via router or UPnP | No new router forwards, localhost-only OpenClaw bindings, dedicated `agent` network, prefer Cloudflare Tunnel or polling | Router settings should still be re-checked after firmware changes |
 | WhatsApp account ban | Keep message volume low, use Official WhatsApp Cloud API | Non-zero risk if ToS violated |
 | Telegram unauth access | Hardcode `allowFrom` to your exact Telegram User ID(s) | Must not leak the User ID or token |
 | Config-write bug exposing secrets | Post-update verification script, use SecretRef providers | Must remember to check after every update |
