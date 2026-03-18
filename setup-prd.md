@@ -72,13 +72,15 @@ The key architectural decision here is a **Hybrid Security Approach**:
 
 This host already has working `media`, `vpn`, and `monitoring` bridge networks. Do **not** replace that layout. OpenClaw should be added as a small, isolated overlay inside the existing compose project.
 
+**Important:** In this guide, **Phase 1 includes the full core stack**: `openclaw`, `litellm`, `citadel`, `openshell`, `browser`, and `proxy`. Nothing in that set is being deferred to a later phase. The only staggered part is **boot order**: dependencies first, onboarding second, `openclaw` last.
+
 ### Host Rules For This Box
 
 1. Keep the existing `media`, `vpn`, and `monitoring` networks unchanged.
 2. Add a dedicated `agent` network for OpenClaw-related services and a tiny `egress` network used only by the outbound proxy.
 3. Bind every OpenClaw host port to `127.0.0.1` only.
 4. Do not add Watchtower labels to the OpenClaw services yet. Your Watchtower config is label-gated, and OpenClaw has a known config-write bug that makes manual upgrades safer.
-5. Do not create any new Virgin router forwards for OpenClaw. If you ever need inbound webhooks later, use a Cloudflare Tunnel rather than the router.
+5. Do not create any new Virgin router forwards for OpenClaw. If you use inbound webhooks in Phase 1, expose them through a Cloudflare Tunnel rather than the router.
 6. Do **not** attach OpenClaw to the shared `monitoring` network. Prefer simple internal health checks plus a host-side watchdog so the agent cannot laterally poke Prometheus, Grafana, Alertmanager, or the rest of the observability plane.
 
 Your current compose already consumes host ports such as `3000`, `8000`, `8081`, `8082`, `8083`, `8085`, `8191`, `8888`, `8989`, `9090`, `9093`, `9100`, `9696`, and `32400`. The OpenClaw ports below (`18789`, `3007`, and optional localhost-only `4000`) do not collide with that layout.
@@ -217,16 +219,74 @@ Because the OpenClaw UI and gateway are bound to localhost only, access them ove
 ssh -L 3007:127.0.0.1:3007 -L 18789:127.0.0.1:18789 vitor@192.168.0.3
 ```
 
+### First Boot Order
+
+Do **not** paste the whole block in and immediately run `docker compose up -d`.
+
+Use this order instead:
+
+1. Create the directories and placeholder files first:
+   - `./config/openclaw`
+   - `./config/litellm`
+   - `./config/openshell`
+   - `./config/citadel-cache`
+   - `./workspace/openclaw`
+   - `./secrets`
+2. Add the compose services and the `agent` / `egress` networks to your existing compose file.
+3. Create the required config files before first boot:
+   - `./config/litellm/config.yaml`
+   - `./config/squid.conf`
+   - `./config/openshell/policies.yaml`
+   - `./secrets/openclaw.env`
+   - `./secrets/litellm.env`
+4. Validate the merged compose file:
+
+```bash
+docker compose config >/dev/null
+```
+
+5. Pull images:
+
+```bash
+docker compose pull proxy litellm citadel browser openshell openclaw
+```
+
+6. Start dependencies only:
+
+```bash
+docker compose up -d proxy litellm citadel browser openshell
+```
+
+7. Confirm those dependencies are up before touching onboarding:
+
+```bash
+docker compose ps
+```
+
+8. Run OpenClaw onboarding:
+
+```bash
+docker compose run --rm openclaw openclaw onboard --install-daemon
+```
+
+9. Start OpenClaw itself:
+
+```bash
+docker compose up -d openclaw
+```
+
+10. Only after that, enable the watchdog and any systemd auto-start wiring.
+
 ### Running Onboard on a Headless Box
 
 The onboard wizard is text-based — works fine over SSH:
 
 ```bash
-# First run: interactive onboarding
+# First run: interactive onboarding after proxy/litellm/citadel/browser/openshell are already up
 docker compose run --rm openclaw openclaw onboard --install-daemon
 
-# Then start the full stack
-docker compose up -d
+# Then start OpenClaw itself
+docker compose up -d openclaw
 ```
 
 ### systemd Auto-Start Service
@@ -1061,34 +1121,31 @@ and household tasks. You are a real person — a remote PA based in the UK.
 3. **Lock down router expectations:** Keep OpenClaw at zero WAN forwards. The only intentional external exposure on this host should remain Plex `32400/TCP` if you explicitly decide to keep it.
 4. **Create new paths:** Prepare `./config/openclaw`, `./config/litellm`, `./config/openshell`, `./config/citadel-cache`, `./workspace/openclaw`, and `./secrets`.
 
-### Phase 1: Merge The Agent Stack Into The Existing Compose Project
+### Phase 1: Build The Full Core Stack
 
-5. **Add the new services and networks:** Merge `openclaw`, `litellm`, `openshell`, `citadel`, `browser`, `proxy`, `agent`, and `egress` into the existing compose file.
+5. **Add the full core service set:** Merge `openclaw`, `litellm`, `openshell`, `citadel`, `browser`, `proxy`, `agent`, and `egress` into the existing compose file.
 6. **Leave the existing media services alone:** Do not move Plex, Pi-hole, Sonarr, Radarr, Bazarr, SABnzbd, Gluetun, or the monitoring stack onto the new networks.
 7. **Keep all new bindings localhost-only:** `18789`, `3007`, and optional `4000` should stay on `127.0.0.1`.
 8. **Do not enable Watchtower for the new services yet:** Upgrade OpenClaw manually until the config-write bug and your post-update secret checks are under control.
-
-### Phase 2: Secrets And External Dependencies
-
-9. **Set up secrets:** Generate age keys, create encrypted secrets with SOPS, and keep the age key outside the server.
+9. **Set up secrets and config files:** Generate age keys, create encrypted secrets with SOPS, and create the required config files before first boot.
 10. **Set up email:** Create `assistant@bitoiu.net` on Zoho Mail.
 11. **Run OAuth consent flows:** On your laptop, run the Python script and copy the token file into the secrets volume.
 12. **Set up Family WhatsApp:** Register the WhatsApp Cloud API in the Meta Developer portal.
 13. **Set up Admin Telegram bots:** Use `@BotFather` to create your specialized bots and find your user ID via `@userinfobot`.
-
-### Phase 3: Deployment And Hardening
-
-14. **Start the agent slice:** `docker compose up -d proxy litellm openshell citadel browser openclaw`
-15. **Run onboarding:** `docker compose run --rm openclaw openclaw onboard --install-daemon`
-16. **Wire up the security layers:**
+14. **Validate compose before starting anything:** `docker compose config >/dev/null`
+15. **Pull the full image set:** `docker compose pull proxy litellm citadel browser openshell openclaw`
+16. **Start dependencies first:** `docker compose up -d proxy litellm citadel browser openshell`
+17. **Run onboarding second:** `docker compose run --rm openclaw openclaw onboard --install-daemon`
+18. **Start OpenClaw last:** `docker compose up -d openclaw`
+19. **Wire up the security layers:**
     - Configure `openclaw.json` to use the OpenShell gRPC endpoint.
     - Install `clawhub install clawsec-suite`
     - Clone and configure the Citadel Guard plugin
-17. **Configure SOUL.md, HEARTBEAT.md, TOOLS.md:** Apply the templates above.
-18. **Validate proxy enforcement:** Confirm model calls and browser automation work through Squid before you trust the setup.
-19. **Enable the local watchdog:** Install the host-side watchdog script and `systemd` timer so OpenClaw can be monitored without joining the shared `monitoring` network.
-20. **Reuse the existing systemd wrapper:** If the current homelab stack already starts via systemd, keep one combined service for the single compose project.
-21. **Test the full flow:** Send a Telegram message, a WhatsApp message, and a Gmail draft request. Verify Calendar writes, Citadel scans, and a blocked test injection.
+20. **Configure SOUL.md, HEARTBEAT.md, TOOLS.md:** Apply the templates above.
+21. **Validate proxy enforcement:** Confirm model calls and browser automation work through Squid before you trust the setup.
+22. **Enable the local watchdog:** Install the host-side watchdog script and `systemd` timer so OpenClaw can be monitored without joining the shared `monitoring` network.
+23. **Reuse the existing systemd wrapper:** If the current homelab stack already starts via systemd, keep one combined service for the single compose project.
+24. **Test the full flow:** Send a Telegram message, a WhatsApp message, and a Gmail draft request. Verify Calendar writes, Citadel scans, and a blocked test injection.
 
 ---
 
