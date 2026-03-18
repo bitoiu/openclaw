@@ -79,6 +79,7 @@ This host already has working `media`, `vpn`, and `monitoring` bridge networks. 
 3. Bind every OpenClaw host port to `127.0.0.1` only.
 4. Do not add Watchtower labels to the OpenClaw services yet. Your Watchtower config is label-gated, and OpenClaw has a known config-write bug that makes manual upgrades safer.
 5. Do not create any new Virgin router forwards for OpenClaw. If you ever need inbound webhooks later, use a Cloudflare Tunnel rather than the router.
+6. Do **not** attach OpenClaw to the shared `monitoring` network. Prefer simple internal health checks plus a host-side watchdog so the agent cannot laterally poke Prometheus, Grafana, Alertmanager, or the rest of the observability plane.
 
 Your current compose already consumes host ports such as `3000`, `8000`, `8081`, `8082`, `8083`, `8085`, `8191`, `8888`, `8989`, `9090`, `9093`, `9100`, `9696`, and `32400`. The OpenClaw ports below (`18789`, `3007`, and optional localhost-only `4000`) do not collide with that layout.
 
@@ -255,6 +256,79 @@ WantedBy=multi-user.target
 ```
 
 Enable: `sudo systemctl enable --now homelab.service`
+
+### Basic Internal Monitoring (No Shared `monitoring` Network)
+
+For v1, keep this intentionally boring:
+
+1. Use Docker health checks where the image already exposes an obvious local endpoint.
+2. Keep `restart: unless-stopped` on every OpenClaw-side service.
+3. Run a small host-side watchdog from the Dell box that checks:
+   - Docker container state / health
+   - the localhost-only gateway endpoint on `127.0.0.1:18789`
+   - the localhost-only UI on `127.0.0.1:3007`
+4. Restart only the failed service, not the whole homelab stack.
+
+Example host watchdog:
+
+```bash
+# /usr/local/bin/openclaw-watchdog.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd /opt/homelab
+
+containers=(openclaw litellm citadel openshell browser proxy)
+
+for c in "${containers[@]}"; do
+  state="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$c" 2>/dev/null || echo missing)"
+  case "$state" in
+    healthy|running)
+      ;;
+    *)
+      echo "$(date -Is) restarting $c (state=$state)" >&2
+      docker compose restart "$c"
+      ;;
+  esac
+done
+
+curl -fsS http://127.0.0.1:18789/health >/dev/null || docker compose restart openclaw
+curl -fsS http://127.0.0.1:3007/ >/dev/null || docker compose restart openclaw
+```
+
+Run it every 5 minutes with a `systemd` timer:
+
+```ini
+# /etc/systemd/system/openclaw-watchdog.service
+[Unit]
+Description=OpenClaw health watchdog
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/openclaw-watchdog.sh
+```
+
+```ini
+# /etc/systemd/system/openclaw-watchdog.timer
+[Unit]
+Description=Run OpenClaw watchdog every 5 minutes
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=5m
+Unit=openclaw-watchdog.service
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable it:
+
+```bash
+sudo chmod +x /usr/local/bin/openclaw-watchdog.sh
+sudo systemctl enable --now openclaw-watchdog.timer
+```
 
 ---
 
@@ -1012,8 +1086,9 @@ and household tasks. You are a real person — a remote PA based in the UK.
     - Clone and configure the Citadel Guard plugin
 17. **Configure SOUL.md, HEARTBEAT.md, TOOLS.md:** Apply the templates above.
 18. **Validate proxy enforcement:** Confirm model calls and browser automation work through Squid before you trust the setup.
-19. **Reuse the existing systemd wrapper:** If the current homelab stack already starts via systemd, keep one combined service for the single compose project.
-20. **Test the full flow:** Send a Telegram message, a WhatsApp message, and a Gmail draft request. Verify Calendar writes, Citadel scans, and a blocked test injection.
+19. **Enable the local watchdog:** Install the host-side watchdog script and `systemd` timer so OpenClaw can be monitored without joining the shared `monitoring` network.
+20. **Reuse the existing systemd wrapper:** If the current homelab stack already starts via systemd, keep one combined service for the single compose project.
+21. **Test the full flow:** Send a Telegram message, a WhatsApp message, and a Gmail draft request. Verify Calendar writes, Citadel scans, and a blocked test injection.
 
 ---
 
@@ -1061,6 +1136,7 @@ An **8 GB** box is no longer ideal once Plex, monitoring, and Playwright all coe
 | Credential exfiltration at runtime | Scoped env vars + egress filtering + no secrets in context window | A compromised process can still read its own env |
 | SOUL.md / memory poisoning | ClawSec soul-guardian + regular integrity checks | Requires ClawSec to be running |
 | Accidental WAN exposure via router or UPnP | No new router forwards, localhost-only OpenClaw bindings, dedicated `agent` network, prefer Cloudflare Tunnel or polling | Router settings should still be re-checked after firmware changes |
+| Lateral movement into observability tools | Keep OpenClaw off the shared `monitoring` network; use host watchdogs and localhost checks instead | Host watchdog still needs maintenance and testing |
 | WhatsApp account ban | Keep message volume low, use Official WhatsApp Cloud API | Non-zero risk if ToS violated |
 | Telegram unauth access | Hardcode `allowFrom` to your exact Telegram User ID(s) | Must not leak the User ID or token |
 | Config-write bug exposing secrets | Post-update verification script, use SecretRef providers | Must remember to check after every update |
