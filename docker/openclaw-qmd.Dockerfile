@@ -1,4 +1,5 @@
-FROM alpine/openclaw:latest
+ARG OPENCLAW_BASE_IMAGE=ghcr.io/openclaw/openclaw:2026.3.13-1
+FROM ${OPENCLAW_BASE_IMAGE}
 
 USER root
 

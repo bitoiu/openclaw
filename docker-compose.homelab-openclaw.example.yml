@@ -301,6 +301,12 @@ services:
       - ./config/openclaw:/home/node/.openclaw
       - ./workspace/openclaw:/home/node/workspace
     networks: [agent]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:18789/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 45s
+      retries: 3
     depends_on:
       - litellm
       - citadel
