@@ -96,6 +96,7 @@ For the agent:
 - read it early
 - update it sparingly with stable facts and links
 - do not dump raw logs here
+- if QMD is enabled, treat it as a better search layer over these files, not as a reason to write sloppier memory
 
 ## Memory Folders
 

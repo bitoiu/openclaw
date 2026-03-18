@@ -272,7 +272,10 @@ services:
 
   # ───────────────────────── OpenClaw Core (Phase 1) ─────────────────────────
   openclaw:
-    image: alpine/openclaw:latest
+    build:
+      context: .
+      dockerfile: ./docker/openclaw-qmd.Dockerfile
+    image: openclaw-qmd:local
     container_name: openclaw
     user: "${PUID}:${PGID}"
     read_only: true
@@ -286,6 +289,8 @@ services:
     environment:
       - NODE_ENV=production
       - TZ=${TZ}
+      - XDG_CACHE_HOME=/home/node/.openclaw/.cache
+      - XDG_CONFIG_HOME=/home/node/.openclaw/.config
       - HTTP_PROXY=http://proxy:3128
       - HTTPS_PROXY=http://proxy:3128
       - NO_PROXY=localhost,127.0.0.1,litellm,citadel,openshell,browser,proxy

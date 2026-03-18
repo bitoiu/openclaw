@@ -28,3 +28,4 @@
 - Keep the heartbeat lightweight and predictable.
 - Do not let heartbeat tasks silently mutate admin config or install anything.
 - Default proactive behavior is reminders and suggestions first, not autonomous irreversible action.
+- Heartbeat exists partly to keep useful long-running context warm, but it should never be abused to fake activity.

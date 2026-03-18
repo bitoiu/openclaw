@@ -10,10 +10,12 @@
 - Internal monitoring plus a host watchdog is preferred over broader network exposure.
 - Morning briefing should go to WhatsApp by default.
 - Personal Gmail drafting is allowed; bot-owned mailbox sends require explicit confirmation.
+- QMD should be enabled from day one as the preferred memory backend.
+- `lossless-claw` is deferred until there is evidence that normal sessions plus QMD are not enough.
+- Local-first observability is preferred over external tracing SaaS for v1.
 
 ## Deferred
 
-- Richer memory layers such as SQLite-backed transcript retention
 - Voice sidecars
 - Additional plugin-heavy automation beyond the core setup
 

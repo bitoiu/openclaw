@@ -92,7 +92,10 @@ Add the following services and networks to the **existing** compose file rather 
 ```yaml
 services:
   openclaw:
-    image: alpine/openclaw:latest
+    build:
+      context: .
+      dockerfile: ./docker/openclaw-qmd.Dockerfile
+    image: openclaw-qmd:local
     container_name: openclaw
     user: "${PUID}:${PGID}"
     read_only: true
@@ -106,6 +109,8 @@ services:
     environment:
       - NODE_ENV=production
       - TZ=${TZ}
+      - XDG_CACHE_HOME=/home/node/.openclaw/.cache
+      - XDG_CONFIG_HOME=/home/node/.openclaw/.config
       - HTTP_PROXY=http://proxy:3128
       - HTTPS_PROXY=http://proxy:3128
       - NO_PROXY=localhost,127.0.0.1,litellm,citadel,openshell,browser,proxy
@@ -235,7 +240,7 @@ cd /home/bitoiu/mediaserver
 2. Create the new directories:
 
 ```bash
-mkdir -p ./config/openclaw ./config/litellm ./config/openshell ./config/citadel-cache ./workspace/openclaw ./secrets
+mkdir -p ./config/openclaw/.cache ./config/openclaw/.config ./config/litellm ./config/openshell ./config/citadel-cache ./workspace/openclaw ./secrets
 ```
 
 3. Create the required placeholder files before first boot:
@@ -252,37 +257,56 @@ touch ./config/litellm/config.yaml ./config/squid.conf ./config/openshell/polici
 docker compose config >/dev/null
 ```
 
-6. Pull images:
+6. Pull dependency images:
 
 ```bash
-docker compose pull proxy litellm citadel browser openshell openclaw
+docker compose pull proxy litellm citadel browser openshell
 ```
 
-7. Start dependencies only:
+7. Build the QMD-enabled OpenClaw image:
+
+```bash
+docker compose build openclaw
+```
+
+8. Start dependencies only:
 
 ```bash
 docker compose up -d proxy litellm citadel browser openshell
 ```
 
-8. Confirm those dependencies are up before touching onboarding:
+9. Confirm those dependencies are up before touching onboarding:
 
 ```bash
 docker compose ps
 ```
 
-9. Run OpenClaw onboarding:
+10. Confirm the `qmd` CLI exists inside the OpenClaw runtime:
+
+```bash
+docker compose run --rm openclaw qmd --help >/dev/null
+```
+
+11. Run OpenClaw onboarding:
 
 ```bash
 docker compose run --rm openclaw openclaw onboard --install-daemon
 ```
 
-10. Start OpenClaw itself:
+12. Start OpenClaw itself:
 
 ```bash
 docker compose up -d openclaw
 ```
 
-11. Only after that, enable the watchdog and any systemd auto-start wiring.
+13. Warm up QMD and build the first memory index:
+
+```bash
+docker compose exec openclaw openclaw memory status --deep --index
+docker compose exec openclaw openclaw memory search --query "household" --max-results 3
+```
+
+14. Only after that, enable the watchdog and any systemd auto-start wiring.
 
 ### Running Onboard on a Headless Box
 
@@ -404,15 +428,15 @@ sudo systemctl enable --now openclaw-watchdog.timer
 
 **Your ChatGPT Plus and Gemini Pro subscriptions cannot be used as API backends.** These are consumer web products with zero programmatic access. Using browser automation to access them violates ToS and results in bans.
 
-Instead, use your Anthropic API key + free API tiers:
+Instead, use your Anthropic API key from the Anthropic Console/API plus free API tiers. Keep Anthropic behind LiteLLM and route different task classes to different models.
 
 | Tier | Model | Cost (per 1M tokens in/out) | Use Case |
 |------|-------|----------------------------|----------|
 | Free | Google AI Studio Gemini 2.5 Flash-Lite | £0/£0 | Heartbeats, simple classification |
 | Free | Groq Llama 3.3 70B | £0/£0 | Fast simple Q&A |
-| Budget | Claude Haiku 4.5 | ~£0.80/£4 | Routine tasks, email drafts |
-| Standard | Claude Sonnet 4.6 | ~£2.40/£12 | Complex tasks, research |
-| Premium | Claude Opus 4.6 | ~£4/£20 | Deep reasoning, critical decisions |
+| Budget | Claude Haiku 3.5 | $0.80 / $4 | Routine tasks, email drafts |
+| Standard | Claude Sonnet 4 | $3 / $15 | Complex tasks, research |
+| Premium | Claude Opus 4.1 | $15 / $75 | Deep reasoning, critical decisions |
 
 **Get a free Google AI Studio API key** at `aistudio.google.com` (no credit card, 1,000 req/day for Flash-Lite).
 
@@ -426,17 +450,17 @@ Instead, use your Anthropic API key + free API tiers:
 model_list:
   - model_name: haiku
     litellm_params:
-      model: anthropic/claude-haiku-4.5
+      model: anthropic/claude-3-5-haiku-20241022
       api_key: os.environ/ANTHROPIC_API_KEY
 
   - model_name: sonnet
     litellm_params:
-      model: anthropic/claude-sonnet-4.6
+      model: anthropic/claude-sonnet-4-20250514
       api_key: os.environ/ANTHROPIC_API_KEY
 
   - model_name: opus
     litellm_params:
-      model: anthropic/claude-opus-4.6
+      model: anthropic/claude-opus-4-1-20250805
       api_key: os.environ/ANTHROPIC_API_KEY
 
   - model_name: gemini-flash
@@ -472,7 +496,7 @@ litellm_settings:
 {
   "agents": {
     "defaults": {
-      "model": { "primary": "anthropic/claude-sonnet-4.6" },
+      "model": { "primary": "anthropic/claude-sonnet-4-20250514" },
       "heartbeat": { "every": "30m" }
     }
   },
@@ -1005,6 +1029,30 @@ with open('token_vitor.json', 'w') as f:
 
 OpenClaw's heartbeat runs periodically (e.g. every 2 hours) to handle scheduled tasks. However, for immediate responsiveness without burning API credits through constant polling, use real-time webhooks.
 
+### WhatsApp Session Hygiene
+
+For your setup, WhatsApp is a long-lived conversation surface, but it should **not** be one giant shared DM session. Because more than one allowlisted person can message the bot, use secure DM mode:
+
+```json
+{
+  "session": {
+    "dmScope": "per-channel-peer",
+    "resetByType": {
+      "direct": { "mode": "idle", "idleMinutes": 10080 },
+      "group": { "mode": "idle", "idleMinutes": 1440 }
+    },
+    "resetTriggers": ["/new", "/reset"]
+  }
+}
+```
+
+This gives you:
+
+- separate WhatsApp DM context per sender
+- a separate family-group session
+- long continuity for normal WhatsApp use
+- an escape hatch: send `/new` or `/reset` in WhatsApp when a thread gets weird or unrelated
+
 ### Google Push Notifications (Webhooks)
 
 Using the Google Cloud Pub/Sub service, configure your integration to send push notifications for Gmail and Calendar directly to OpenClaw's webhook endpoint (exposed securely via Cloudflare Tunnels). This ensures the agent is only invoked exactly when a new email arrives or an event is modified, providing a much more immediate "PA" response.
@@ -1019,7 +1067,7 @@ Using the Google Cloud Pub/Sub service, configure your integration to send push 
 - Check monitored GitHub repos for new PRs, failed CI, or mentions.
 
 ## Daily at 08:00
-- Morning briefing to the **WhatsApp Family Group** AND your **Telegram PA**:
+- Morning briefing to the **WhatsApp Family Group**:
   - Today's calendar events
   - Unread email summary
   - Overnight price alerts
@@ -1032,6 +1080,64 @@ Using the Google Cloud Pub/Sub service, configure your integration to send push 
 ### Price Tracking
 
 Use Playwright in the browser container to scrape product pages on a cron schedule. Store prices in a JSON file in the workspace. The heartbeat checks for drops and alerts via Telegram or WhatsApp.
+
+### Memory Backend: QMD From Day One
+
+Use QMD from the start for memory retrieval. QMD is an official OpenClaw memory backend that swaps the built-in SQLite indexer for a local-first search sidecar. It works **with or without** `lossless-claw` because the two solve different problems:
+
+- `memory.backend = "qmd"` improves recall over Markdown memory and optional session exports
+- `lossless-claw` is a separate context/history strategy for preserving old conversation detail
+
+Recommendation for v1:
+
+- enable QMD from day one
+- do **not** add `lossless-claw` yet
+- revisit `lossless-claw` only if long-session compaction becomes a real pain
+
+Concrete Docker solution:
+
+- build `openclaw` from [docker/openclaw-qmd.Dockerfile](/Users/bitoiu/src/openclaw/docker/openclaw-qmd.Dockerfile) so the `qmd` CLI is baked into the runtime
+- set `XDG_CACHE_HOME=/home/node/.openclaw/.cache` so QMD models and indexes live inside the existing writable `./config/openclaw` volume instead of the container's read-only root filesystem
+- after first boot, run `openclaw memory status --deep --index` once to trigger the initial model download, health probe, and index build
+
+That means the v1 choice is:
+
+- **QMD only**
+- **no `lossless-claw` yet**
+
+If you later decide you need `lossless-claw`, add it on top of a working QMD setup rather than introducing both moving parts on day one.
+
+Example config:
+
+```json
+{
+  "memory": {
+    "backend": "qmd",
+    "citations": "auto",
+    "qmd": {
+      "includeDefaultMemory": true,
+      "sessions": {
+        "enabled": true,
+        "retentionDays": 14
+      },
+      "update": {
+        "interval": "5m",
+        "debounceMs": 15000
+      },
+      "limits": {
+        "maxResults": 6,
+        "timeoutMs": 4000
+      },
+      "scope": {
+        "default": "deny",
+        "rules": [
+          { "action": "allow", "match": { "chatType": "direct" } }
+        ]
+      }
+    }
+  }
+}
+```
 
 ---
 
@@ -1139,7 +1245,7 @@ and household tasks. You are a real person — a remote PA based in the UK.
 1. **Back up the current stack:** Save the current compose file and the `./config` tree from `192.168.0.3` before merging anything.
 2. **Remove qBittorrent from the target state:** This guide assumes it is retired rather than carried forward beside OpenClaw.
 3. **Lock down router expectations:** Keep OpenClaw at zero WAN forwards. The only intentional external exposure on this host should remain Plex `32400/TCP` if you explicitly decide to keep it.
-4. **Create new paths:** Prepare `./config/openclaw`, `./config/litellm`, `./config/openshell`, `./config/citadel-cache`, `./workspace/openclaw`, and `./secrets`.
+4. **Create new paths:** Prepare `./config/openclaw` (including `.cache` and `.config`), `./config/litellm`, `./config/openshell`, `./config/citadel-cache`, `./workspace/openclaw`, and `./secrets`.
 
 ### Phase 1: Build The Full Core Stack
 
@@ -1153,19 +1259,23 @@ and household tasks. You are a real person — a remote PA based in the UK.
 12. **Set up Family WhatsApp:** Register the WhatsApp Cloud API in the Meta Developer portal.
 13. **Set up Admin Telegram bots:** Use `@BotFather` to create your specialized bots and find your user ID via `@userinfobot`.
 14. **Validate compose before starting anything:** `docker compose config >/dev/null`
-15. **Pull the full image set:** `docker compose pull proxy litellm citadel browser openshell openclaw`
-16. **Start dependencies first:** `docker compose up -d proxy litellm citadel browser openshell`
-17. **Run onboarding second:** `docker compose run --rm openclaw openclaw onboard --install-daemon`
-18. **Start OpenClaw last:** `docker compose up -d openclaw`
-19. **Wire up the security layers:**
+15. **Pull dependency images:** `docker compose pull proxy litellm citadel browser openshell`
+16. **Build the QMD-enabled OpenClaw image:** `docker compose build openclaw`
+17. **Start dependencies first:** `docker compose up -d proxy litellm citadel browser openshell`
+18. **Verify the QMD runtime:** `docker compose run --rm openclaw qmd --help >/dev/null`
+19. **Run onboarding second:** `docker compose run --rm openclaw openclaw onboard --install-daemon`
+20. **Start OpenClaw last:** `docker compose up -d openclaw`
+21. **Warm up QMD and build the first index:** `docker compose exec openclaw openclaw memory status --deep --index`
+22. **Sanity-check memory retrieval:** `docker compose exec openclaw openclaw memory search --query "household" --max-results 3`
+23. **Wire up the security layers:**
     - Configure `openclaw.json` to use the OpenShell gRPC endpoint.
     - Install `clawhub install clawsec-suite`
     - Clone and configure the Citadel Guard plugin
-20. **Configure SOUL.md, HEARTBEAT.md, TOOLS.md:** Apply the templates above.
-21. **Validate proxy enforcement:** Confirm model calls and browser automation work through Squid before you trust the setup.
-22. **Enable the local watchdog:** Install the host-side watchdog script and `systemd` timer so OpenClaw can be monitored without joining the shared `monitoring` network.
-23. **Reuse the existing systemd wrapper:** If the current homelab stack already starts via systemd, keep one combined service for the single compose project.
-24. **Test the full flow:** Send a Telegram message, a WhatsApp message, and a Gmail draft request. Verify Calendar writes, Citadel scans, and a blocked test injection.
+24. **Configure SOUL.md, HEARTBEAT.md, TOOLS.md:** Apply the templates above.
+25. **Validate proxy enforcement:** Confirm model calls and browser automation work through Squid before you trust the setup.
+26. **Enable the local watchdog:** Install the host-side watchdog script and `systemd` timer so OpenClaw can be monitored without joining the shared `monitoring` network.
+27. **Reuse the existing systemd wrapper:** If the current homelab stack already starts via systemd, keep one combined service for the single compose project.
+28. **Test the full flow:** Send a Telegram message, a WhatsApp message, and a Gmail draft request. Verify Calendar writes, Citadel scans, and a blocked test injection.
 
 ---
 

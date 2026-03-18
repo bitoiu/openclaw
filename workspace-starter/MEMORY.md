@@ -13,6 +13,7 @@ This file is a curated long-term summary and routing index.
 - WhatsApp is a family and approval channel; Telegram or local shell is reserved for admin work.
 - Morning briefing should go to WhatsApp by default.
 - Personal Gmail drafting can be proactive; bot-mail sending requires an explicit confirmation keyword.
+- QMD is the preferred memory backend from day one; `lossless-claw` is deferred.
 
 ## People
 

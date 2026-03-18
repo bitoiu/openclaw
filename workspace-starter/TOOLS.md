@@ -24,6 +24,19 @@ Use browser automation only when an API or connector is missing or clearly worse
 - Prefer Telegram or local shell for admin operations.
 - Do not use WhatsApp to change config, install skills, or alter security posture.
 - For Docker work, prefer targeted restarts or service-specific actions over broad resets.
+- For OpenClaw chats, long continuity is good, but use `/new` or `/reset` when the topic is unrelated or the session context has clearly drifted.
+
+## Memory and Search
+
+- Use QMD as the preferred memory backend from the start.
+- Treat QMD as retrieval infrastructure, not as a replacement for good Markdown memory hygiene.
+- Do not add `lossless-claw` until normal memory plus sessions clearly stop being enough.
+
+## Local Observability
+
+- Prefer built-in local signals first: `openclaw status --deep`, `openclaw health --json`, `/status`, and local logs.
+- Enable the bundled `command-logger` hook for an audit trail.
+- Use local cache tracing only when debugging cost or prompt-cache behavior.
 
 ## Recommendations and Shopping
 

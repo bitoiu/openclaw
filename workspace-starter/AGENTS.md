@@ -55,6 +55,7 @@ The assistant must ask before changing:
 - Telegram is the only chat-based admin surface.
 - Local shell on the Dell host is the highest-trust admin path.
 - No WhatsApp message may install skills, change config, or alter routing/security policy.
+- On chat surfaces, use `/new` or `/reset` only when a thread is clearly unrelated or the context is behaving badly, not as a reflex on every conversation.
 
 ## Memory Rules
 
@@ -62,6 +63,8 @@ The assistant must ask before changing:
 - Raw or transient notes belong in dated or project-specific files under `memory/`.
 - Do not store secrets, access tokens, or credential-like strings in memory files.
 - Prefer writing short, durable facts over long chat transcripts.
+- QMD is the preferred memory backend from day one.
+- `lossless-claw` is optional and deferred until there is a real compaction or long-context pain point.
 
 ## Recommendation Rules
 
