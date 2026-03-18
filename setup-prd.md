@@ -87,7 +87,7 @@ Your current compose already consumes host ports such as `3000`, `8000`, `8081`,
 
 ### Additive Compose Overlay
 
-Add the following services and networks to the **existing** compose file rather than replacing the media stack:
+Add the following services and networks to the **existing** compose file rather than replacing the media stack. A full merged example based on your current homelab stack is in [docker-compose.homelab-openclaw.example.yml](/Users/bitoiu/src/openclaw/docker-compose.homelab-openclaw.example.yml).
 
 ```yaml
 services:
@@ -181,7 +181,7 @@ services:
 
   browser:
     image: mcr.microsoft.com/playwright:v1.58.2-noble
-    container_name: openclaw-browser
+    container_name: browser
     command: npx playwright run-server --port 3000 --host 0.0.0.0
     shm_size: "1g"
     networks: [agent]
@@ -189,7 +189,7 @@ services:
 
   proxy:
     image: ubuntu/squid:latest
-    container_name: openclaw-egress-proxy
+    container_name: proxy
     volumes:
       - ./config/squid.conf:/etc/squid/squid.conf:ro
     networks:
@@ -216,66 +216,73 @@ networks:
 Because the OpenClaw UI and gateway are bound to localhost only, access them over SSH from your laptop instead of exposing them on the LAN:
 
 ```bash
-ssh -L 3007:127.0.0.1:3007 -L 18789:127.0.0.1:18789 vitor@192.168.0.3
+ssh -L 3007:127.0.0.1:3007 -L 18789:127.0.0.1:18789 bitoiu@192.168.0.3
 ```
 
 ### First Boot Order
 
 Do **not** paste the whole block in and immediately run `docker compose up -d`.
 
-Use this order instead:
+Use this order instead. These commands assume your compose project already lives in `/home/bitoiu/mediaserver` on the Dell:
 
-1. Create the directories and placeholder files first:
-   - `./config/openclaw`
-   - `./config/litellm`
-   - `./config/openshell`
-   - `./config/citadel-cache`
-   - `./workspace/openclaw`
-   - `./secrets`
-2. Add the compose services and the `agent` / `egress` networks to your existing compose file.
-3. Create the required config files before first boot:
-   - `./config/litellm/config.yaml`
-   - `./config/squid.conf`
-   - `./config/openshell/policies.yaml`
-   - `./secrets/openclaw.env`
-   - `./secrets/litellm.env`
-4. Validate the merged compose file:
+1. SSH in and move to the project directory:
+
+```bash
+ssh bitoiu@192.168.0.3
+cd /home/bitoiu/mediaserver
+```
+
+2. Create the new directories:
+
+```bash
+mkdir -p ./config/openclaw ./config/litellm ./config/openshell ./config/citadel-cache ./workspace/openclaw ./secrets
+```
+
+3. Create the required placeholder files before first boot:
+
+```bash
+touch ./config/litellm/config.yaml ./config/squid.conf ./config/openshell/policies.yaml ./secrets/openclaw.env ./secrets/litellm.env
+```
+
+4. Replace or merge the compose file with the full example from [docker-compose.homelab-openclaw.example.yml](/Users/bitoiu/src/openclaw/docker-compose.homelab-openclaw.example.yml).
+
+5. Validate the merged compose file:
 
 ```bash
 docker compose config >/dev/null
 ```
 
-5. Pull images:
+6. Pull images:
 
 ```bash
 docker compose pull proxy litellm citadel browser openshell openclaw
 ```
 
-6. Start dependencies only:
+7. Start dependencies only:
 
 ```bash
 docker compose up -d proxy litellm citadel browser openshell
 ```
 
-7. Confirm those dependencies are up before touching onboarding:
+8. Confirm those dependencies are up before touching onboarding:
 
 ```bash
 docker compose ps
 ```
 
-8. Run OpenClaw onboarding:
+9. Run OpenClaw onboarding:
 
 ```bash
 docker compose run --rm openclaw openclaw onboard --install-daemon
 ```
 
-9. Start OpenClaw itself:
+10. Start OpenClaw itself:
 
 ```bash
 docker compose up -d openclaw
 ```
 
-10. Only after that, enable the watchdog and any systemd auto-start wiring.
+11. Only after that, enable the watchdog and any systemd auto-start wiring.
 
 ### Running Onboard on a Headless Box
 
@@ -294,6 +301,7 @@ docker compose up -d openclaw
 If your current media stack already boots through a systemd unit, extend that existing unit for the combined compose file. Do **not** create a second competing service against the same project directory.
 
 ```ini
+# Example only — if you already have a compose-backed unit, reuse it instead of creating a second unit.
 # /etc/systemd/system/homelab.service
 [Unit]
 Description=Combined Homelab Docker Compose Stack
@@ -304,7 +312,7 @@ After=docker.service network-online.target
 Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=300
-WorkingDirectory=/opt/homelab
+WorkingDirectory=/home/bitoiu/mediaserver
 ExecStartPre=/usr/bin/docker compose pull --quiet --ignore-pull-failures
 ExecStart=/usr/bin/docker compose up -d --remove-orphans
 ExecStop=/usr/bin/docker compose down
@@ -336,7 +344,7 @@ Example host watchdog:
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /opt/homelab
+cd /home/bitoiu/mediaserver
 
 containers=(openclaw litellm citadel openshell browser proxy)
 
@@ -413,7 +421,7 @@ Instead, use your Anthropic API key + free API tiers:
 **Critical rule:** Tasks that read untrusted content (emails, web pages) MUST route to Claude Sonnet or Opus. Cheaper/smaller models are far more susceptible to prompt injection.
 
 ```yaml
-# config/litellm_config.yaml
+# ./config/litellm/config.yaml
 
 model_list:
   - model_name: haiku
