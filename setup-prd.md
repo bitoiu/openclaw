@@ -2,7 +2,7 @@
 
 **Author:** Generated for Vitor Monteiro · **Date:** March 2026
 **Note:** All references to the admin user are "Vitor" throughout.
-**Stack:** OpenClaw + LiteLLM + Citadel Guard + Playwright, co-located on the existing `192.168.0.3` Docker host alongside Pi-hole, Plex, the Arr stack, SABnzbd, Gluetun tooling, and Prometheus/Grafana. This target state assumes qBittorrent is retired from the server.
+**Stack:** OpenClaw + LiteLLM + LLM Guard + Playwright, co-located on the existing `192.168.0.3` Docker host alongside Pi-hole, Plex, the Arr stack, SABnzbd, Gluetun tooling, and Prometheus/Grafana. This target state assumes qBittorrent is retired from the server.
 **Estimated monthly cost:** £5–15 (Anthropic API) + £1 (Zoho Mail)
 
 ---
@@ -12,7 +12,7 @@
 1. [Architecture Overview](#1-architecture-overview)
 2. [Docker Compose Stack](#2-docker-compose-stack)
 3. [Hybrid LLM Routing via LiteLLM](#3-hybrid-llm-routing-via-litellm)
-4. [Security Layer 1: Citadel Guard (LLM Firewall)](#4-security-layer-1-citadel-guard-llm-firewall)
+4. [Security Layer 1: LLM Guard (Prompt Firewall)](#4-security-layer-1-llm-guard-prompt-firewall)
 5. [Security Layer 2: Skill Supply Chain Protection](#5-security-layer-2-skill-supply-chain-protection)
 6. [Security Layer 3: Secrets Architecture & Anti-Exfiltration](#6-security-layer-3-secrets-architecture--anti-exfiltration)
 7. [Security Layer 4: ClawSec Integrity Monitoring](#7-security-layer-4-clawsec-integrity-monitoring)
@@ -45,8 +45,8 @@ WhatsApp (you/wife)
         │
         ▼
 ┌─────────────────────┐    ┌──────────────────┐
-│   OpenClaw Gateway   │───▶│  Citadel Guard    │──▶ BLOCK if injection detected
-│   (port 18789)       │    │  (BERT ML scanner)│
+│   OpenClaw Gateway   │───▶│  LLM Guard        │──▶ BLOCK if injection detected
+│   (port 18789)       │    │  (ProtectAI)      │
 └─────────┬───────────┘    └──────────────────┘
           │
           ▼
@@ -57,14 +57,16 @@ WhatsApp (you/wife)
           │
           ▼
 ┌─────────────────────┐    ┌──────────────────┐
-│   Tools / Skills      │───▶│ NVIDIA OpenShell │
-│   (Skill dispatcher)  │    │ (Sandbox Context)│
+│   Tools / Skills      │───▶│ AIO Sandbox       │
+│   (Skill dispatcher)  │    │ (REST execution)  │
 └───────────────────── ┘    └──────────────────┘
 ```
 
 The key architectural decision here is a **Hybrid Security Approach**:
-1. We use **Citadel Guard** (running locally on CPU) for prompt injection scanning to ensure 100% on-device data privacy without needing expensive cloud GPU endpoints.
-2. We use **NVIDIA OpenShell** for runtime execution, replacing standard file-system execution. Even if a prompt injection slips past Citadel, OpenShell physically prevents the agent from making rogue network calls or accessing unauthorized files.
+1. We use **LLM Guard** by ProtectAI (`laiyer/llm-guard-api`) running locally on CPU for prompt injection scanning to ensure 100% on-device data privacy without needing expensive cloud GPU endpoints.
+2. We use **AIO Sandbox** by agent-infra (`ghcr.io/agent-infra/sandbox`) for runtime execution, replacing standard filesystem execution. Even if a prompt injection slips past LLM Guard, the sandbox isolates tool execution in a separate container with its own filesystem and constrained resources.
+
+> **Note:** The original version of this guide referenced "NVIDIA OpenShell" (`ghcr.io/nvidia/openshell:latest`). That image does not exist. AIO Sandbox ([github.com/agent-infra/sandbox](https://github.com/agent-infra/sandbox)) serves the same role — sandboxed execution via a REST API — and is available as a standard Docker container.
 
 ---
 
@@ -72,7 +74,7 @@ The key architectural decision here is a **Hybrid Security Approach**:
 
 This host already has working `media`, `vpn`, and `monitoring` bridge networks. Do **not** replace that layout. OpenClaw should be added as a small, isolated overlay inside the existing compose project.
 
-**Important:** In this guide, **Phase 1 includes the full core stack**: `openclaw`, `litellm`, `citadel`, `openshell`, `browser`, and `proxy`. Nothing in that set is being deferred to a later phase. The only staggered part is **boot order**: dependencies first, onboarding second, `openclaw` last.
+**Important:** In this guide, **Phase 1 includes the full core stack**: `openclaw`, `litellm`, `llm-guard`, `sandbox`, `browser`, and `proxy`. Nothing in that set is being deferred to a later phase. The only staggered part is **boot order**: dependencies first, onboarding second, `openclaw` last.
 
 ### Host Rules For This Box
 
@@ -94,7 +96,7 @@ services:
   openclaw:
     build:
       context: .
-      dockerfile: ./docker/openclaw-qmd.Dockerfile
+      dockerfile: ./openclaw/docker/openclaw-qmd.Dockerfile
     image: openclaw-qmd:local
     container_name: openclaw
     user: "${PUID}:${PGID}"
@@ -113,7 +115,7 @@ services:
       - XDG_CONFIG_HOME=/home/node/.openclaw/.config
       - HTTP_PROXY=http://proxy:3128
       - HTTPS_PROXY=http://proxy:3128
-      - NO_PROXY=localhost,127.0.0.1,litellm,citadel,openshell,browser,proxy
+      - NO_PROXY=localhost,127.0.0.1,litellm,llm-guard,browser,proxy
     ports:
       - "127.0.0.1:18789:18789"
       - "127.0.0.1:3007:3007"
@@ -129,8 +131,7 @@ services:
       retries: 3
     depends_on:
       - litellm
-      - citadel
-      - openshell
+      - llm-guard
       - browser
       - proxy
     restart: unless-stopped
@@ -150,7 +151,7 @@ services:
       - TZ=${TZ}
       - HTTP_PROXY=http://proxy:3128
       - HTTPS_PROXY=http://proxy:3128
-      - NO_PROXY=localhost,127.0.0.1,openclaw,citadel,openshell,browser,proxy
+      - NO_PROXY=localhost,127.0.0.1,openclaw,llm-guard,browser,proxy
     ports:
       - "127.0.0.1:4000:4000"
     volumes:
@@ -158,36 +159,50 @@ services:
     networks: [agent]
     restart: unless-stopped
 
-  openshell:
-    image: ghcr.io/nvidia/openshell:latest
-    container_name: openshell
-    security_opt:
-      - apparmor:unconfined
-    cap_add:
-      - SYS_ADMIN
+  llm-guard:
+    image: laiyer/llm-guard-api:latest
+    container_name: llm-guard
+    environment:
+      - LOG_LEVEL=INFO
+      - SCAN_FAIL_FAST=False
+      - SCAN_PROMPT_TIMEOUT=10
+      - SCAN_OUTPUT_TIMEOUT=30
     volumes:
-      - ./config/openshell/policies.yaml:/etc/openshell/policies.yaml:ro
-      - ./workspace/openclaw:/mnt/workspace
+      - ./config/llm-guard/scanners.yml:/home/user/app/config/scanners.yml:ro
     expose:
-      - "50051"
+      - "8000"
     networks: [agent]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
     restart: unless-stopped
 
-  citadel:
-    image: ghcr.io/trymightyai/citadel:latest
-    container_name: citadel
-    command: ["--port", "3333"]
+  sandbox:
+    image: ghcr.io/agent-infra/sandbox:latest
+    container_name: sandbox
+    security_opt:
+      - seccomp:unconfined
+    shm_size: "1g"
+    mem_limit: "2g"
+    cpus: "2"
     environment:
-      - CITADEL_AUTO_DOWNLOAD_MODEL=true
-      - CITADEL_ENABLE_HUGOT=true
-      - HTTP_PROXY=http://proxy:3128
-      - HTTPS_PROXY=http://proxy:3128
-      - NO_PROXY=localhost,127.0.0.1,openclaw,litellm,openshell,browser,proxy
+      - WORKSPACE=/home/gem
+      - DISABLE_JUPYTER=true
+      - DISABLE_CODE_SERVER=true
     volumes:
-      - ./config/citadel-cache:/root/.cache/huggingface
+      - ./workspace/openclaw:/home/gem/workspace
     expose:
-      - "3333"
+      - "8080"
     networks: [agent]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/v1/sandbox >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
     restart: unless-stopped
 
   browser:
@@ -246,13 +261,13 @@ cd /home/bitoiu/mediaserver
 2. Create the new directories:
 
 ```bash
-mkdir -p ./config/openclaw/.cache ./config/openclaw/.config ./config/litellm ./config/openshell ./config/citadel-cache ./workspace/openclaw ./secrets
+mkdir -p ./config/openclaw/.cache ./config/openclaw/.config ./config/litellm ./config/llm-guard ./workspace/openclaw ./secrets
 ```
 
 3. Create the required placeholder files before first boot:
 
 ```bash
-touch ./config/litellm/config.yaml ./config/squid.conf ./config/openshell/policies.yaml ./config/allowed-egress-domains.txt ./secrets/openclaw.env ./secrets/litellm.env
+touch ./config/litellm/config.yaml ./config/squid.conf ./config/llm-guard/scanners.yml ./config/allowed-egress-domains.txt ./secrets/openclaw.env ./secrets/litellm.env
 ```
 
 4. Replace or merge the compose file with the full example from [docker-compose.homelab-openclaw.example.yml](/Users/bitoiu/src/openclaw/docker-compose.homelab-openclaw.example.yml).
@@ -266,7 +281,7 @@ docker compose config >/dev/null
 6. Pull dependency images:
 
 ```bash
-docker compose pull proxy litellm citadel browser openshell
+docker compose pull proxy litellm llm-guard sandbox browser
 ```
 
 7. Build the QMD-enabled OpenClaw image:
@@ -278,7 +293,7 @@ docker compose build openclaw
 8. Start dependencies only:
 
 ```bash
-docker compose up -d proxy litellm citadel browser openshell
+docker compose up -d proxy litellm llm-guard sandbox browser
 ```
 
 9. Confirm those dependencies are up before touching onboarding:
@@ -290,7 +305,7 @@ docker compose ps
 Quick dependency checkpoint:
 
 ```bash
-docker inspect -f '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' proxy litellm citadel openshell browser
+docker inspect -f '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' proxy litellm llm-guard browser
 ```
 
 10. Confirm the `qmd` CLI exists inside the OpenClaw runtime:
@@ -325,7 +340,7 @@ docker compose exec openclaw openclaw memory search --query "household" --max-re
 The onboard wizard is text-based — works fine over SSH:
 
 ```bash
-# First run: interactive onboarding after proxy/litellm/citadel/browser/openshell are already up
+# First run: interactive onboarding after proxy/litellm/llm-guard/browser are already up
 docker compose run --rm openclaw openclaw onboard --install-daemon
 
 # Then start OpenClaw itself
@@ -387,7 +402,7 @@ cd /home/bitoiu/mediaserver
 exec 9>/run/lock/openclaw-watchdog.lock
 flock -n 9 || exit 0
 
-containers=(openclaw litellm citadel openshell browser proxy)
+containers=(openclaw litellm llm-guard sandbox browser proxy)
 
 restart_container() {
   local c="$1"
@@ -542,24 +557,44 @@ litellm_settings:
 
 ---
 
-## 4. Security Layer 1: Citadel Guard (Local Prompt Firewall)
+## 4. Security Layer 1: LLM Guard (Prompt Firewall)
 
-This is your **real-time prompt injection scanner**. It runs a local BERT model (~685 MB) that classifies every inbound and outbound message for injection attempts, jailbreaks, and data exfiltration patterns.
+> **Note:** The original version of this guide referenced "Citadel Guard" (`ghcr.io/trymightyai/citadel:latest`). That image does not exist on GHCR. The real equivalent is **LLM Guard** by ProtectAI ([github.com/protectai/llm-guard](https://github.com/protectai/llm-guard)), available as `laiyer/llm-guard-api` on Docker Hub.
+
+This is your **real-time prompt injection scanner**. It runs local ML models (DeBERTa-based) that classify every inbound and outbound message for injection attempts, jailbreaks, secrets leakage, and data exfiltration patterns.
 
 ### How It Works
 
-Citadel Guard integrates with OpenClaw's plugin hook system. It intercepts tool results from `web_fetch`, `browser`, `exec`, and `read` — scanning them before they reach the LLM's context window. This is critical because the main attack vector isn't someone messaging your bot directly (that's locked down by `allowFrom`), it's **malicious instructions embedded in emails, web pages, and documents** that the agent reads.
+LLM Guard runs as an HTTP API (`laiyer/llm-guard-api`) on port 8000. It intercepts tool results from `web_fetch`, `browser`, `exec`, and `read` — scanning them before they reach the LLM's context window. This is critical because the main attack vector isn't someone messaging your bot directly (that's locked down by `allowFrom`), it's **malicious instructions embedded in emails, web pages, and documents** that the agent reads.
 
 ### Installation
 
-The Citadel container is already in the Docker Compose above. Install the OpenClaw plugin:
+The LLM Guard container is already in the Docker Compose above. Configure the scanner in `./config/llm-guard/scanners.yml`:
 
-```bash
-# Inside the OpenClaw container
-docker compose exec openclaw bash
-cd ~/.openclaw
-git clone https://github.com/TryMightyAI/citadel-guard-openclaw.git plugins/citadel-guard
-cd plugins/citadel-guard && bun install
+```yaml
+input_scanners:
+  - type: PromptInjection
+    params:
+      threshold: 0.92
+      match_type: truncate_head_tail
+      model_max_length: 256
+
+  - type: Secrets
+    params:
+      redact_mode: all
+
+  - type: Toxicity
+    params:
+      threshold: 0.8
+
+output_scanners:
+  - type: NoRefusal
+    params:
+      threshold: 0.5
+
+  - type: Sensitive
+    params:
+      redact: true
 ```
 
 Configure in `openclaw.json`:
@@ -567,10 +602,10 @@ Configure in `openclaw.json`:
 ```json
 {
   "plugins": {
-    "enabled": ["citadel-guard"],
-    "citadel-guard": {
-      "service_url": "http://citadel:3333",
-      "timeout_ms": 5000,
+    "enabled": ["llm-guard"],
+    "llm-guard": {
+      "service_url": "http://llm-guard:8000",
+      "timeout_ms": 10000,
       "fail_open": false,
       "scan_enabled": true,
       "features": {
@@ -581,92 +616,81 @@ Configure in `openclaw.json`:
 }
 ```
 
-**Set `fail_open: false`** — if Citadel is down, the agent should stop processing rather than operate unscanned.
+**Set `fail_open: false`** — if LLM Guard is down, the agent should stop processing rather than operate unscanned.
 
-### What Citadel Catches
+### What LLM Guard Catches
 
 - Prompt injection patterns ("ignore previous instructions", "you are now...")
 - Jailbreak attempts
-- Data exfiltration instructions hidden in HTML comments, email signatures, PDF metadata
-- Role-play attacks designed to extract system prompts
+- Secrets leakage (API keys, passwords in output)
+- Toxic content
+- Data exfiltration instructions hidden in text content
 
-### What Citadel Does NOT Catch (Limitations)
+### What LLM Guard Does NOT Catch (Limitations)
 
-- The open-source version is text-only — it cannot scan images or PDFs for embedded injections
+- Text-only — it cannot scan images or PDFs for embedded injections
 - Sophisticated multi-turn social engineering that builds gradually across messages
-- Novel attack patterns not in the BERT model's training data
+- Novel attack patterns not in the model's training data
 - Content in languages other than English may have lower detection accuracy
-
-For the Pro tier (paid), multimodal scanning covers images and PDFs.
+- **RAM:** Requires significant memory (~1–2 GB) for model loading; the official docs recommend 16 GB total Docker allocation
 
 ---
 
-## 5. Security Layer 2: NVIDIA OpenShell (Execution Sandbox)
+## 5. Security Layer 2: AIO Sandbox (Execution Sandbox) + Skill Supply Chain Protection
+
+> **Note:** The original version of this guide referenced "NVIDIA OpenShell" (`ghcr.io/nvidia/openshell:latest`). That image does not exist. The real replacement is **AIO Sandbox** by agent-infra ([github.com/agent-infra/sandbox](https://github.com/agent-infra/sandbox)), available as `ghcr.io/agent-infra/sandbox:latest`. It provides a REST API for sandboxed shell execution, file operations, and browser automation in a single Docker container.
 
 The most dangerous attack surface after prompt injection is malicious skills. **The ClawHub skill registry has no mandatory security review** and has historically hosted malware that steals API keys via `process.env` or arbitrary shell execution.
 
-Instead of relying on manual code review, we utilize **NVIDIA OpenShell**, an open-source, policy-driven sandboxing runtime built explicitly for AI agent execution.
+### How OpenClaw Calls the Sandbox
 
-### How OpenClaw Calls OpenShell 
+When the agent decides to use a tool (e.g., executing a Python script, compiling a Node app, or making an HTTP request), the OpenClaw Gateway does not execute this directly on its own container filesystem.
 
-When the agent decides to use a tool (e.g., executing a python script, compiling a node app, or making an HTTP request), the OpenClaw Gateway does not execute this directly on its own container filesystem.
+Instead, OpenClaw is configured to route execution through the `sandbox` container:
+1. OpenClaw sends an HTTP POST to `http://sandbox:8080/v1/shell/exec` with the command.
+2. The sandbox executes it in an isolated environment with its own filesystem.
+3. The output (stdout/stderr/exit code) is returned via the REST response.
 
-Instead, OpenClaw is configured to use OpenShell as its `runtime_engine`. 
-1. OpenClaw packages the tool command and sends a gRPC request to the `openshell` daemon container on port `50051`.
-2. OpenShell spawns an ephemeral, tightly constrained micro-sandbox (using Linux namespaces and seccomp profiles).
-3. The code runs inside this sandbox.
-4. The output is streamed back to OpenClaw.
-
-### Activating OpenShell in OpenClaw
+### Activating the Sandbox in OpenClaw
 
 In your OpenClaw configuration, override the default execution engine:
 
 ```json
 {
   "runtime": {
-    "engine": "openshell",
-    "openshell_target": "grpc://openshell:50051",
-    "mount_workspace": true 
+    "engine": "sandbox",
+    "sandbox_target": "http://sandbox:8080",
+    "mount_workspace": true
   }
 }
 ```
 
-### Defining the OpenShell Policy
+### Sandbox REST API (Key Endpoints)
 
-The brilliance of OpenShell is that you physically define what network requests and file access the agent is allowed to make. Even if the LLM hallucinates or a malicious prompt tells the agent to `curl ` an attacker's server, the OpenShell runtime intercepts the OS-level system call and kills the process.
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/v1/shell/exec` | Execute a shell command |
+| `POST` | `/v1/file/read` | Read file contents |
+| `POST` | `/v1/file/write` | Write file |
+| `GET` | `/v1/sandbox` | Sandbox info / health |
+| `GET` | `/v1/docs` | Swagger API docs |
 
-Create `./config/openshell/policies.yaml`:
+### Additional Docker-Level Isolation
 
-```yaml
-version: "1"
-policies:
-  default:
-    network:
-      egress:
-        # Deny all network traffic by default
-        default_action: deny
-        allow_rules:
-          # Only allow traffic to known Google/Anthropic endpoints for API calls
-          - domains: ["api.anthropic.com", "generativelanguage.googleapis.com"]
-          # Allow traffic to Zoho for sending emails
-          - domains: ["smtp.zoho.com"]
-    filesystem:
-      readonly_mounts:
-        # The agent can read its configurations but CANNOT modify them
-        - /mnt/workspace/config
-        - /mnt/workspace/soul
-      readwrite_mounts:
-        # Agent can only write to the temporary scratchpad
-        - /mnt/workspace/tmp
-    environment:
-      # Explicitly drop all environment variables from reaching the sandbox
-      # This physically prevents a malicious skill running 'printenv' to steal keys
-      pass_through: []
-```
+The `openclaw` container itself is also locked down:
+- `read_only: true` — the container filesystem cannot be modified at runtime
+- `cap_drop: [ALL]` — all Linux capabilities are dropped
+- `no-new-privileges: true` — prevents privilege escalation
+- `tmpfs: /tmp:noexec,nosuid,size=200m` — temp space cannot execute binaries
+- All egress is routed through the Squid proxy with a domain allowlist
 
-### Residual Manual Vetting
+This two-layer approach (sandboxed execution + locked-down gateway) prevents most runtime attacks.
 
-While OpenShell provides an OS-level firewall against malicious execution, you should still practice basic hygiene:
+> **Future upgrade:** For hardware-level VM isolation (stronger than containers), consider [microsandbox](https://github.com/microsandbox/microsandbox) — requires KVM on the host.
+
+### Manual Vetting
+
+You should still practice basic hygiene:
 1. Don't let skills auto-update. Pin to specific versions.
 2. Run `clawhub install skill-vetter` to do basic static analysis before installing new skills.
 
@@ -794,10 +818,10 @@ Never mount your entire `.env` file or host environment. Inject only the specifi
 
 Do not use host-level `iptables` rules for container network isolation, as Docker routinely overwrites or bypasses them. Instead, use the dedicated egress proxy container (`squid`) plus Docker network boundaries.
 
-1. Keep `openclaw`, `litellm`, `citadel`, `openshell`, and `browser` on the isolated `agent` network only.
+1. Keep `openclaw`, `litellm`, `llm-guard`, `sandbox`, and `browser` on the isolated `agent` network only.
 2. Put only the `proxy` container on both `agent` and `egress`.
 3. Route outbound HTTP/HTTPS traffic through the proxy by setting `HTTP_PROXY=http://proxy:3128` and `HTTPS_PROXY=http://proxy:3128` in the relevant containers.
-4. Maintain `./config/allowed-egress-domains.txt` as the **single source of truth** for outbound domains. Generate both the Squid allowlist and the OpenShell network allow rules from that one file.
+4. Maintain `./config/allowed-egress-domains.txt` as the **single source of truth** for outbound domains. Generate the Squid allowlist from that file.
 5. Keep `agent` marked `internal: true` so OpenClaw does not accidentally gain direct internet access or lateral reach into `media` or `vpn`.
 
 This prevents a compromised agent from exfiltrating data to arbitrary external servers. Even if an injection tells the agent to send data to `evil.com`, the network layer blocks it.
@@ -813,7 +837,7 @@ api.github.com
 graph.facebook.com
 ```
 
-Do **not** hand-edit the Squid and OpenShell domain lists independently. If a domain is needed, add it to the canonical allowlist and regenerate both configs together.
+If a domain is needed, add it to the canonical allowlist and regenerate the Squid config.
 
 #### Layer E: Transport-Layer BCC Enforcement
 
@@ -1301,7 +1325,7 @@ and household tasks. You are a real person — a remote PA based in the UK.
 1. **Back up the current stack:** Save the current compose file and the `./config` tree from `192.168.0.3` before merging anything.
 2. **Remove qBittorrent from the target state:** This guide assumes it is retired rather than carried forward beside OpenClaw.
 3. **Lock down router expectations:** Keep OpenClaw at zero WAN forwards. The only intentional external exposure on this host should remain Plex `32400/TCP` if you explicitly decide to keep it.
-4. **Create new paths:** Prepare `./config/openclaw` (including `.cache` and `.config`), `./config/litellm`, `./config/openshell`, `./config/citadel-cache`, `./workspace/openclaw`, and `./secrets`.
+4. **Create new paths:** Prepare `./config/openclaw` (including `.cache` and `.config`), `./config/litellm`, `./config/llm-guard`, `./workspace/openclaw`, and `./secrets`.
 
 #### Phase 0 Gate: Host Baseline Checks
 
@@ -1326,16 +1350,17 @@ Expected outcome:
 
 ### Phase 1: Build The Core Runtime
 
-5. **Add the full core service set:** Merge `openclaw`, `litellm`, `openshell`, `citadel`, `browser`, `proxy`, `agent`, and `egress` into the existing compose file.
+5. **Add the full core service set:** Merge `openclaw`, `litellm`, `llm-guard`, `sandbox`, `browser`, `proxy`, `agent`, and `egress` into the existing compose file.
 6. **Leave the existing media services alone:** Do not move Plex, Pi-hole, Sonarr, Radarr, Bazarr, SABnzbd, Gluetun, or the monitoring stack onto the new networks.
 7. **Keep all new bindings localhost-only:** `18789`, `3007`, and optional `4000` should stay on `127.0.0.1`.
 8. **Do not enable Watchtower for the new services yet:** Pin OpenClaw to a reviewed release and upgrade it manually.
 9. **Set up secrets and config files:** Generate age keys, create encrypted secrets with SOPS, and create the required config files before first boot.
 10. **Validate compose before starting anything:** `docker compose config >/dev/null`
-11. **Pull dependency images:** `docker compose pull proxy litellm citadel browser openshell`
+11. **Pull dependency images:** `docker compose pull proxy litellm llm-guard sandbox browser`
 12. **Build the QMD-enabled OpenClaw image:** `docker compose build openclaw`
-13. **Start dependencies first:** `docker compose up -d proxy litellm citadel browser openshell`
+13. **Start dependencies first:** `docker compose up -d proxy litellm llm-guard sandbox browser`
 14. **Verify the QMD runtime:** `docker compose run --rm openclaw qmd --help >/dev/null`
+
 15. **Run onboarding second:** `docker compose run --rm openclaw openclaw onboard --install-daemon`
 16. **Start OpenClaw last:** `docker compose up -d openclaw`
 17. **Warm up QMD and build the first index:** `docker compose exec openclaw openclaw memory status --deep --index`
@@ -1350,7 +1375,7 @@ cd /home/bitoiu/mediaserver
 
 docker compose ps
 
-docker inspect -f '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' openclaw litellm citadel openshell browser proxy
+docker inspect -f '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' openclaw litellm llm-guard sandbox browser proxy
 
 curl -fsS http://127.0.0.1:18789/health >/dev/null
 curl -fsS http://127.0.0.1:3007/ >/dev/null
@@ -1407,10 +1432,9 @@ Expected outcome:
 
 ### Phase 3: Apply Security Controls
 
-25. **Configure OpenShell in `openclaw.json`:** point the runtime at `grpc://openshell:50051`.
-26. **Generate the egress policy from one allowlist:** maintain `./config/allowed-egress-domains.txt`, then generate/update both `./config/squid.conf` and `./config/openshell/policies.yaml` from that file.
-27. **Install ClawSec:** `clawhub install clawsec-suite`
-28. **Clone and configure the Citadel Guard plugin:** keep `fail_open: false`.
+25. **Generate the egress policy from one allowlist:** maintain `./config/allowed-egress-domains.txt`, then generate/update `./config/squid.conf` from that file.
+26. **Install ClawSec:** `clawhub install clawsec-suite`
+27. **Configure the LLM Guard plugin in `openclaw.json`:** point at `http://llm-guard:8000`, keep `fail_open: false`.
 29. **Optionally make `openclaw.json` host-read-only after onboarding:** `chmod 400 ./config/openclaw/openclaw.json`
 
 #### Phase 3 Gate: Security Acceptance Tests
@@ -1418,7 +1442,7 @@ Expected outcome:
 ```bash
 cd /home/bitoiu/mediaserver
 
-docker compose logs --tail=200 openclaw citadel proxy | tail -n 200
+docker compose logs --tail=200 openclaw llm-guard proxy | tail -n 200
 
 if docker compose exec openclaw sh -lc 'curl -fsS https://example.com >/dev/null'; then
   echo 'FAIL: non-allowlisted egress succeeded'
@@ -1444,7 +1468,7 @@ Expected outcome:
 
 - blocked egress really fails
 - allowlisted egress still works
-- Citadel/OpenClaw logs show scanning rather than silent bypass
+- LLM Guard/OpenClaw logs show scanning rather than silent bypass
 - malicious instructions are refused or escalated, not followed
 
 ### Phase 4: Load Workspace, Persona, And Memory Conventions
@@ -1524,11 +1548,11 @@ Expected outcome:
 |-----------|-----------|-----------|
 | OpenClaw Gateway | 300 MB | 800 MB |
 | LiteLLM Proxy | 150 MB | 300 MB |
-| Citadel Guard (BERT) | 700 MB | 900 MB |
-| NVIDIA OpenShell | 200 MB | 500 MB |
+| LLM Guard (ProtectAI) | 1.0 GB | 1.5 GB |
+| AIO Sandbox (agent-infra) | 300 MB | 2.0 GB |
 | Playwright Browser | 300 MB | 1.5 GB |
 | Squid proxy | 50 MB | 100 MB |
-| **OpenClaw subtotal** | **~1.7 GB** | **~4.1 GB** |
+| **OpenClaw subtotal** | **~2.1 GB** | **~5.6 GB** |
 
 ### Existing Host Load (Approximate, Without qBittorrent)
 
@@ -1544,7 +1568,7 @@ Expected outcome:
 
 | Total | RAM (Idle) | RAM (Peak) |
 |------|-----------|-----------|
-| Existing stack + OpenClaw | ~4.0 GB | ~9.9 GB |
+| Existing stack + OpenClaw | ~4.4 GB | ~11.4 GB |
 
 A **16 GB** mini PC is the comfortable target for this combined workload.
 An **8 GB** box is no longer ideal once Plex, monitoring, and Playwright all coexist, especially if Plex ever transcodes.
@@ -1555,8 +1579,8 @@ An **8 GB** box is no longer ideal once Plex, monitoring, and Playwright all coe
 
 | Risk | Mitigation | Residual Risk |
 |------|-----------|---------------|
-| Prompt injection via email | Citadel Guard local scanner + Claude minimum for tasks | Sophisticated multi-turn attacks may bypass |
-| Malicious ClawHub skills | NVIDIA OpenShell runtime OS network/file sandboxing | Sandbox escapes (highly rare but possible) |
+| Prompt injection via email | LLM Guard local scanner + Claude minimum for untrusted content | Sophisticated multi-turn attacks may bypass |
+| Malicious ClawHub skills | AIO Sandbox runtime isolation + Docker lockdown (read-only, cap-drop) + egress proxy | Container escapes (rare but possible); sandbox is container-level not VM-level isolation |
 | Credential exfiltration at runtime | Scoped env vars + egress filtering + no secrets in context window | A compromised process can still read its own env |
 | SOUL.md / memory poisoning | ClawSec soul-guardian + regular integrity checks | Requires ClawSec to be running |
 | Accidental WAN exposure via router or UPnP | No new router forwards, localhost-only OpenClaw bindings, dedicated `agent` network, prefer Cloudflare Tunnel or polling | Router settings should still be re-checked after firmware changes |
