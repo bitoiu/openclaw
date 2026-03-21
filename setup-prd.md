@@ -13,7 +13,7 @@
 2. [Docker Compose Stack](#2-docker-compose-stack)
 3. [Hybrid LLM Routing via LiteLLM](#3-hybrid-llm-routing-via-litellm)
 4. [Security Layer 1: LLM Guard (Prompt Firewall)](#4-security-layer-1-llm-guard-prompt-firewall)
-5. [Security Layer 2: Skill Supply Chain Protection](#5-security-layer-2-skill-supply-chain-protection)
+5. [Security Layer 2: Egress & Agent Firewall Stack](#5-security-layer-2-egress--agent-firewall-stack)
 6. [Security Layer 3: Secrets Architecture & Anti-Exfiltration](#6-security-layer-3-secrets-architecture--anti-exfiltration)
 7. [Security Layer 4: ClawSec Integrity Monitoring](#7-security-layer-4-clawsec-integrity-monitoring)
 8. [Email Integration (assistant@bitoiu.net)](#8-email-integration-assistantbitoiunet)
@@ -27,6 +27,7 @@
 16. [Persona & SOUL.md Configuration](#16-persona--soulmd-configuration)
 17. [Deployment Sequence (Step by Step)](#17-deployment-sequence-step-by-step)
 18. [RAM Budget & Hardware Requirements](#18-ram-budget--hardware-requirements)
+19. [Future Work / Known Gaps](#future-work--known-gaps)
 
 ---
 
@@ -74,7 +75,7 @@ The key architectural decision here is a **Hybrid Security Approach**:
 
 This host already has working `media`, `vpn`, and `monitoring` bridge networks. Do **not** replace that layout. OpenClaw should be added as a small, isolated overlay inside the existing compose project.
 
-**Important:** In this guide, **Phase 1 includes the full core stack**: `openclaw`, `litellm`, `llm-guard`, `sandbox`, `browser`, and `proxy`. Nothing in that set is being deferred to a later phase. The only staggered part is **boot order**: dependencies first, onboarding second, `openclaw` last.
+**Important:** In this guide, **Phase 1 includes the full core stack**: `openclaw`, `litellm`, `llm-guard`, `sandbox`, `browser`, `proxy`, `pipelock`, and `media-bridge`. Nothing in that set is being deferred to a later phase. The only staggered part is **boot order**: dependencies first, onboarding second, `openclaw` last.
 
 ### Host Rules For This Box
 
@@ -82,7 +83,7 @@ This host already has working `media`, `vpn`, and `monitoring` bridge networks. 
 2. Add a dedicated `agent` network for OpenClaw-related services and a tiny `egress` network used only by the outbound proxy.
 3. Bind every OpenClaw host port to `127.0.0.1` only.
 4. Do not add Watchtower labels to the OpenClaw services yet. Pin OpenClaw to a reviewed release and upgrade it manually rather than floating on `latest`.
-5. Do not create any new Virgin router forwards for OpenClaw. If you use inbound webhooks in Phase 1, expose them through a Cloudflare Tunnel rather than the router.
+5. Do not create any new Virgin router forwards for OpenClaw. If you use inbound webhooks in Phase 1, expose them through a Tailscale Funnel rather than the router.
 6. Do **not** attach OpenClaw to the shared `monitoring` network. Prefer simple internal health checks plus a host-side watchdog so the agent cannot laterally poke Prometheus, Grafana, Alertmanager, or the rest of the observability plane.
 
 Your current compose already consumes host ports such as `3000`, `8000`, `8081`, `8082`, `8083`, `8085`, `8191`, `8888`, `8989`, `9090`, `9093`, `9100`, `9696`, and `32400`. The OpenClaw ports below (`18789`, `3007`, and optional localhost-only `4000`) do not collide with that layout.
@@ -113,16 +114,19 @@ services:
       - TZ=${TZ}
       - XDG_CACHE_HOME=/home/node/.openclaw/.cache
       - XDG_CONFIG_HOME=/home/node/.openclaw/.config
-      - HTTP_PROXY=http://proxy:3128
-      - HTTPS_PROXY=http://proxy:3128
-      - NO_PROXY=localhost,127.0.0.1,litellm,llm-guard,browser,proxy
+      # All egress from openclaw flows through pipelock (agent firewall), not squid directly
+      - HTTP_PROXY=http://pipelock:8888
+      - HTTPS_PROXY=http://pipelock:8888
+      - NO_PROXY=localhost,127.0.0.1,litellm,llm-guard,sandbox,browser,proxy,pipelock
     ports:
-      - "127.0.0.1:18789:18789"
-      - "127.0.0.1:3007:3007"
+      - "18789:18789"
+      - "3007:3007"
     volumes:
       - ./config/openclaw:/home/node/.openclaw
       - ./workspace/openclaw:/home/node/workspace
-    networks: [agent]
+    networks:
+      - agent
+      - gateway
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:18789/health >/dev/null || exit 1"]
       interval: 30s
@@ -132,8 +136,10 @@ services:
     depends_on:
       - litellm
       - llm-guard
+      - sandbox
       - browser
       - proxy
+      - pipelock
     restart: unless-stopped
     logging:
       driver: json-file
@@ -149,36 +155,56 @@ services:
       - ./secrets/litellm.env
     environment:
       - TZ=${TZ}
-      - HTTP_PROXY=http://proxy:3128
-      - HTTPS_PROXY=http://proxy:3128
-      - NO_PROXY=localhost,127.0.0.1,openclaw,llm-guard,browser,proxy
+      - HTTP_PROXY=http://pipelock:8888
+      - HTTPS_PROXY=http://pipelock:8888
+      - NO_PROXY=localhost,127.0.0.1,openclaw,llm-guard,sandbox,browser,proxy,pipelock
     ports:
       - "127.0.0.1:4000:4000"
     volumes:
       - ./config/litellm/config.yaml:/app/config.yaml:ro
     networks: [agent]
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   llm-guard:
-    image: laiyer/llm-guard-api:latest
+    build:
+      context: .
+      dockerfile: ./docker/llm-guard.Dockerfile
+    image: llm-guard-xet:local
     container_name: llm-guard
     environment:
+      - TZ=${TZ}
       - LOG_LEVEL=INFO
       - SCAN_FAIL_FAST=False
       - SCAN_PROMPT_TIMEOUT=10
       - SCAN_OUTPUT_TIMEOUT=30
+      - HTTP_PROXY=http://pipelock:8888
+      - HTTPS_PROXY=http://pipelock:8888
+      - NO_PROXY=localhost,127.0.0.1,openclaw,litellm,sandbox,browser,proxy,pipelock
     volumes:
       - ./config/llm-guard/scanners.yml:/home/user/app/config/scanners.yml:ro
+      - llm-guard-models:/home/user/.cache
     expose:
       - "8000"
     networks: [agent]
+    depends_on:
+      - proxy
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/healthz >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')\" || exit 1"]
       interval: 30s
       timeout: 10s
-      start_period: 120s
+      start_period: 600s
       retries: 3
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   sandbox:
     image: ghcr.io/agent-infra/sandbox:latest
@@ -189,11 +215,10 @@ services:
     mem_limit: "2g"
     cpus: "2"
     environment:
+      - TZ=${TZ}
       - WORKSPACE=/home/gem
       - DISABLE_JUPYTER=true
       - DISABLE_CODE_SERVER=true
-    volumes:
-      - ./workspace/openclaw:/home/gem/workspace
     expose:
       - "8080"
     networks: [agent]
@@ -204,14 +229,29 @@ services:
       start_period: 60s
       retries: 3
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   browser:
     image: mcr.microsoft.com/playwright:v1.58.2-noble
     container_name: browser
     command: npx playwright run-server --port 3000 --host 0.0.0.0
+    environment:
+      - TZ=${TZ}
+      - HTTP_PROXY=http://proxy:3128
+      - HTTPS_PROXY=http://proxy:3128
+      - NO_PROXY=localhost,127.0.0.1,openclaw,litellm,llm-guard,sandbox,browser,proxy,pipelock
     shm_size: "1g"
     networks: [agent]
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   proxy:
     image: ubuntu/squid:latest
@@ -222,6 +262,77 @@ services:
       - agent
       - egress
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  pipelock:
+    image: ghcr.io/luckypipewrench/pipelock:1.5.0
+    container_name: pipelock
+    command: run --config /config/pipelock.yaml
+    environment:
+      # Pipelock's own outbound chains through Squid for domain enforcement
+      - HTTP_PROXY=http://proxy:3128
+      - HTTPS_PROXY=http://proxy:3128
+      - NO_PROXY=localhost,127.0.0.1,proxy
+    volumes:
+      - ./config/pipelock/pipelock.yaml:/config/pipelock.yaml:ro
+    expose:
+      - "8888"
+    networks:
+      - agent
+      - egress
+    depends_on:
+      - proxy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --tries=1 --spider http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  media-bridge:
+    build:
+      context: ./docker/media-bridge
+      dockerfile: Dockerfile
+    image: media-bridge:local
+    container_name: media-bridge
+    env_file:
+      - ./secrets/openclaw.env
+    environment:
+      - SONARR_URL=http://sonarr:8989
+      - RADARR_URL=http://radarr:7878
+    expose:
+      - "8090"
+    networks:
+      - agent
+      - media
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    depends_on:
+      - sonarr
+      - radarr
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  llm-guard-models:
 
 networks:
   media:
@@ -233,6 +344,8 @@ networks:
   agent:
     driver: bridge
     internal: true
+  gateway:
+    driver: bridge
   egress:
     driver: bridge
 ```
@@ -281,19 +394,19 @@ docker compose config >/dev/null
 6. Pull dependency images:
 
 ```bash
-docker compose pull proxy litellm llm-guard sandbox browser
+docker compose pull proxy pipelock litellm sandbox browser
 ```
 
-7. Build the QMD-enabled OpenClaw image:
+7. Build the QMD-enabled OpenClaw image and custom containers:
 
 ```bash
-docker compose build openclaw
+docker compose build openclaw llm-guard media-bridge
 ```
 
 8. Start dependencies only:
 
 ```bash
-docker compose up -d proxy litellm llm-guard sandbox browser
+docker compose up -d proxy pipelock litellm llm-guard sandbox browser media-bridge
 ```
 
 9. Confirm those dependencies are up before touching onboarding:
@@ -402,7 +515,7 @@ cd /home/bitoiu/mediaserver
 exec 9>/run/lock/openclaw-watchdog.lock
 flock -n 9 || exit 0
 
-containers=(openclaw litellm llm-guard sandbox browser proxy)
+containers=(openclaw litellm llm-guard sandbox browser proxy pipelock media-bridge)
 
 restart_container() {
   local c="$1"
@@ -636,9 +749,51 @@ Configure in `openclaw.json`:
 
 ---
 
-## 5. Security Layer 2: AIO Sandbox (Execution Sandbox) + Skill Supply Chain Protection
+## 5. Security Layer 2: Egress & Agent Firewall Stack
 
-> **Note:** The original version of this guide referenced "NVIDIA OpenShell" (`ghcr.io/nvidia/openshell:latest`). That image does not exist. The real replacement is **AIO Sandbox** by agent-infra ([github.com/agent-infra/sandbox](https://github.com/agent-infra/sandbox)), available as `ghcr.io/agent-infra/sandbox:latest`. It provides a REST API for sandboxed shell execution, file operations, and browser automation in a single Docker container.
+The actual implementation uses a **four-layer egress and agent firewall stack** that sits between the agent and the internet. Each layer addresses a distinct threat.
+
+### Layer A: Pipelock (Agent Firewall — Primary Egress Control)
+
+**Pipelock** (`ghcr.io/luckypipewrench/pipelock:1.5.0`) runs in strict mode as a forward proxy on port `8888`. All egress from `openclaw` and `litellm` flows through Pipelock before reaching the internet. It enforces:
+
+- **Domain allowlist:** blocks any outbound HTTPS/HTTP request to a non-allowlisted domain at the proxy level, regardless of what the LLM instructs.
+- **DLP (Data Loss Prevention) scanning:** inspects outbound request bodies for patterns matching secrets, PII, and credential-shaped payloads, and rejects the request if a match is found.
+- **Strict mode:** unknown or unclassified traffic is blocked by default; explicit allow-rules are required.
+
+Pipelock itself chains outbound through Squid (Layer D) so domain enforcement is applied at two independent checkpoints.
+
+### Layer B: LLM Guard (Prompt Injection Scanning on LLM Outputs)
+
+**LLM Guard** by ProtectAI runs as a local HTTP API on port `8000` and scans both inbound prompts and LLM outputs using local DeBERTa-based ML models. It catches:
+
+- Prompt injection patterns ("ignore previous instructions", "you are now...")
+- Jailbreak attempts
+- Secrets leakage in model outputs (API keys, passwords)
+- Data exfiltration instructions embedded in text content
+
+This layer operates on the *content* of messages, while Pipelock operates on the *network destination* of outbound requests — they are complementary, not redundant.
+
+> **Known gap:** LLM Guard has no native hook for tool output scanning in OpenClaw 2026.3.13. The current mitigation is behavioural guidance via `AGENTS.md`. A native tool-output hook would require either a custom OpenClaw plugin or an upstream SDK addition.
+
+### Layer C: LiteLLM Built-In Guardrails
+
+LiteLLM provides two built-in guardrail hooks configured in `config/litellm/config.yaml`:
+
+- **`hide-secrets` (pre_call):** strips credential-shaped strings from prompts before they reach the model provider.
+- **`content-filter` (during_call):** applies content classification to flag or block policy-violating model calls in flight.
+
+These run inside the LiteLLM process itself, providing a defence layer that cannot be bypassed even if LLM Guard is temporarily unavailable.
+
+### Layer D: Squid (Domain Allowlist Backstop)
+
+**Squid** (`ubuntu/squid:latest`) serves as the terminal egress checkpoint. Only Pipelock and the `browser` container route directly through Squid. The domain allowlist is maintained in `./config/allowed-egress-domains.txt` and generates the Squid ACL config. Any domain not in the allowlist is blocked at this layer even if Pipelock were to malfunction.
+
+> **TLS interception:** disabled in the current deployment. Pipelock cannot inspect HTTPS payloads without a CA cert distributed to all containers. This is tracked as future work — see the Future Work section below.
+
+---
+
+### Skill Supply Chain Protection
 
 The most dangerous attack surface after prompt injection is malicious skills. **The ClawHub skill registry has no mandatory security review** and has historically hosted malware that steals API keys via `process.env` or arbitrary shell execution.
 
@@ -1135,7 +1290,7 @@ This gives you:
 
 ### Google Push Notifications (Webhooks)
 
-Using the Google Cloud Pub/Sub service, configure your integration to send push notifications for Gmail and Calendar directly to OpenClaw's webhook endpoint (exposed securely via Cloudflare Tunnels). This ensures the agent is only invoked exactly when a new email arrives or an event is modified, providing a much more immediate "PA" response.
+Using the Google Cloud Pub/Sub service, configure your integration to send push notifications for Gmail and Calendar directly to OpenClaw's webhook endpoint (exposed securely via Tailscale Funnel). This ensures the agent is only invoked exactly when a new email arrives or an event is modified, providing a much more immediate "PA" response.
 
 ### HEARTBEAT.md
 
@@ -1239,7 +1394,7 @@ Use a **fine-grained Personal Access Token** with read-only access to specific r
 
 **Polling via heartbeat** (recommended — no inbound connectivity needed): Add GitHub checks to HEARTBEAT.md. The agent calls the GitHub API every 15–30 minutes to check for new PRs, failed CI, and mentions on your specified repos.
 
-For real-time webhooks, set up a **Cloudflare Tunnel** (free) to expose a webhook endpoint without opening firewall ports.
+For real-time webhooks, set up a **Tailscale Funnel** to expose a webhook endpoint without opening firewall ports.
 
 ---
 
@@ -1350,15 +1505,15 @@ Expected outcome:
 
 ### Phase 1: Build The Core Runtime
 
-5. **Add the full core service set:** Merge `openclaw`, `litellm`, `llm-guard`, `sandbox`, `browser`, `proxy`, `agent`, and `egress` into the existing compose file.
+5. **Add the full core service set:** Merge `openclaw`, `litellm`, `llm-guard`, `sandbox`, `browser`, `proxy`, `pipelock`, `media-bridge`, `agent`, `gateway`, and `egress` into the existing compose file.
 6. **Leave the existing media services alone:** Do not move Plex, Pi-hole, Sonarr, Radarr, Bazarr, SABnzbd, Gluetun, or the monitoring stack onto the new networks.
 7. **Keep all new bindings localhost-only:** `18789`, `3007`, and optional `4000` should stay on `127.0.0.1`.
 8. **Do not enable Watchtower for the new services yet:** Pin OpenClaw to a reviewed release and upgrade it manually.
 9. **Set up secrets and config files:** Generate age keys, create encrypted secrets with SOPS, and create the required config files before first boot.
 10. **Validate compose before starting anything:** `docker compose config >/dev/null`
-11. **Pull dependency images:** `docker compose pull proxy litellm llm-guard sandbox browser`
-12. **Build the QMD-enabled OpenClaw image:** `docker compose build openclaw`
-13. **Start dependencies first:** `docker compose up -d proxy litellm llm-guard sandbox browser`
+11. **Pull dependency images:** `docker compose pull proxy pipelock litellm sandbox browser`
+12. **Build the QMD-enabled OpenClaw image and custom containers:** `docker compose build openclaw llm-guard media-bridge`
+13. **Start dependencies first:** `docker compose up -d proxy pipelock litellm llm-guard sandbox browser media-bridge`
 14. **Verify the QMD runtime:** `docker compose run --rm openclaw qmd --help >/dev/null`
 
 15. **Run onboarding second:** `docker compose run --rm openclaw openclaw onboard --install-daemon`
@@ -1375,7 +1530,7 @@ cd /home/bitoiu/mediaserver
 
 docker compose ps
 
-docker inspect -f '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' openclaw litellm llm-guard sandbox browser proxy
+docker inspect -f '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' openclaw litellm llm-guard sandbox browser proxy pipelock media-bridge
 
 curl -fsS http://127.0.0.1:18789/health >/dev/null
 curl -fsS http://127.0.0.1:3007/ >/dev/null
@@ -1552,7 +1707,9 @@ Expected outcome:
 | AIO Sandbox (agent-infra) | 300 MB | 2.0 GB |
 | Playwright Browser | 300 MB | 1.5 GB |
 | Squid proxy | 50 MB | 100 MB |
-| **OpenClaw subtotal** | **~2.1 GB** | **~5.6 GB** |
+| Pipelock (agent firewall) | 50 MB | 150 MB |
+| media-bridge | 30 MB | 60 MB |
+| **OpenClaw subtotal** | **~2.2 GB** | **~6.4 GB** |
 
 ### Existing Host Load (Approximate, Without qBittorrent)
 
@@ -1568,7 +1725,7 @@ Expected outcome:
 
 | Total | RAM (Idle) | RAM (Peak) |
 |------|-----------|-----------|
-| Existing stack + OpenClaw | ~4.4 GB | ~11.4 GB |
+| Existing stack + OpenClaw | ~4.5 GB | ~12.2 GB |
 
 A **16 GB** mini PC is the comfortable target for this combined workload.
 An **8 GB** box is no longer ideal once Plex, monitoring, and Playwright all coexist, especially if Plex ever transcodes.
@@ -1583,8 +1740,24 @@ An **8 GB** box is no longer ideal once Plex, monitoring, and Playwright all coe
 | Malicious ClawHub skills | AIO Sandbox runtime isolation + Docker lockdown (read-only, cap-drop) + egress proxy | Container escapes (rare but possible); sandbox is container-level not VM-level isolation |
 | Credential exfiltration at runtime | Scoped env vars + egress filtering + no secrets in context window | A compromised process can still read its own env |
 | SOUL.md / memory poisoning | ClawSec soul-guardian + regular integrity checks | Requires ClawSec to be running |
-| Accidental WAN exposure via router or UPnP | No new router forwards, localhost-only OpenClaw bindings, dedicated `agent` network, prefer Cloudflare Tunnel or polling | Router settings should still be re-checked after firmware changes |
+| Accidental WAN exposure via router or UPnP | No new router forwards, localhost-only OpenClaw bindings, dedicated `agent` network, prefer Tailscale Funnel or polling | Router settings should still be re-checked after firmware changes |
 | Lateral movement into observability tools | Keep OpenClaw off the shared `monitoring` network; use host watchdogs and localhost checks instead | Host watchdog still needs maintenance and testing |
 | WhatsApp account ban | Keep message volume low, use Official WhatsApp Cloud API | Non-zero risk if ToS violated |
 | Telegram unauth access | Hardcode `allowFrom` to your exact Telegram User ID(s) | Must not leak the User ID or token |
 | Config-write bug exposing secrets | Post-update verification script, use SecretRef providers | Must remember to check after every update |
+
+---
+
+## Future Work / Known Gaps
+
+These items are acknowledged but intentionally deferred. They should be revisited in priority order after Phase 5 is stable.
+
+| Item | Status | Notes |
+|------|--------|-------|
+| **TLS interception for Pipelock** | Deferred | Pipelock cannot inspect HTTPS payloads without a CA cert distributed to all containers. Requires generating a local CA, baking the cert into the `openclaw`, `litellm`, `llm-guard`, `sandbox`, and `browser` images at build time, and configuring Pipelock's TLS interception mode. See Pipelock TLS interception docs. |
+| **Sophonn's Google OAuth token** | Pending | The OAuth consent flow for `sophonnkhov@gmail.com` has not been run yet. Calendar and Gmail access for Sophonn's tasks is blocked until this is done. |
+| **WhatsApp channels** | Pending giffgaff SIM | A dedicated UK number is needed to register the WhatsApp Business account via the Meta Developer Portal. Blocked on giffgaff SIM arrival and activation. |
+| **Zoho email (`assistant@bitoiu.net`)** | Parked | The Zoho Mail Lite account and DNS records for `bitoiu.net` have not been configured. The agent cannot send or receive email via this address until this is done. |
+| **LLM Guard native tool output hook** | No native hook in OpenClaw 2026.3.13 | LLM Guard currently only scans prompts and model outputs, not tool call results flowing back into the agent context. The current mitigation is behavioural guidance via `AGENTS.md`. A native hook would require a custom OpenClaw plugin or upstream SDK support. |
+| **Voice support** | Pending WhatsApp | sherpa-onnx TTS and Whisper STT containers are planned for inbound/outbound voice note handling. Deferred until WhatsApp channel is live, since Telegram voice notes are lower priority for this household. |
+| **MontanaPlanner second Telegram bot** | Parked | A dedicated Telegram bot for household planning tasks (MontanaPlanner) was discussed but not implemented. Parked until core channels are stable. |
