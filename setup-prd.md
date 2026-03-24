@@ -7,6 +7,34 @@
 
 ---
 
+## Deployment Status — 2026-03-21
+
+> Last updated 2026-03-21. This section reflects actual deployed state; the rest of the document is the original design reference.
+
+### Phase Gate Summary
+
+| Phase | Name | Status | Notes |
+|-------|------|--------|-------|
+| **0** | Host Baseline | ✅ Done | qBittorrent retired; paths created; existing stack unchanged |
+| **1** | Core Runtime | ✅ Done | All services running: `openclaw`, `litellm`, `llm-guard`, `sandbox`, `browser`, `proxy`, `pipelock`, `media-bridge`. OpenClaw healthy. |
+| **2** | Channels & Accounts | ✅ Partial | Telegram ✅, Google OAuth (Vitor) ✅, Gmail read/draft ✅, Google Calendar ✅. WhatsApp disabled pending phone — see Known Gaps. Sophonn OAuth pending. |
+| **3** | Security Controls | ✅ Done | Egress blocked via Pipelock+Squid. `openclaw.json` read-only. Security audit: **0 critical, 0 warn**. LLM Guard container running + wired via skill and AGENTS.md mandate. |
+| **4** | Workspace & Persona | ✅ Done | `SOUL.md`, `AGENTS.md`, `TOOLS.md`, `HEARTBEAT.md`, `MEMORY.md`, `IDENTITY.md`, `USER.md`, `USER.private.md` all deployed. Memory indexed. Alfred responding as intended on Telegram. |
+| **5** | Operationalise | ✅ Done | `mediaserver.service` installed + enabled (systemd auto-start on boot). Watchdog script running via cron every 5 min, alerts to Telegram on container down/recovery. |
+
+### Known Deviations from Original PRD
+
+| Item | PRD assumption | Reality |
+|------|---------------|---------|
+| **NVIDIA OpenShell** | Sandboxed execution via OpenShell container | Image doesn't exist as designed; using AIO Sandbox (`ghcr.io/agent-infra/sandbox`) instead |
+| **ClawSec / ClawHub** | `clawhub install clawsec-suite` | ClawHub not used; OpenClaw 2026.3.13 has native `openclaw security audit` which covers the same ground |
+| **LLM Guard plugin** | Wired into OpenClaw as a plugin/middleware | No native plugin exists; container runs and scans independently; integration deferred to a future skill |
+| **WhatsApp** | Meta WhatsApp Cloud API (token + phone number ID) | OpenClaw's native WhatsApp channel uses **Baileys (QR scan)**, not Meta API. Meta credentials removed. Blocked on phone arrival. |
+| **Pipelock healthcheck** | ✅ Fixed | Changed to `CMD ["/pipelock", "healthcheck"]`. Now reports healthy. |
+| **Gateway self-probe (operator.read)** | CLI self-probes gateway in `security audit --deep` | CLI inside container cannot authenticate to gateway with operator scope; probe shows as failed. Gateway is functional. Cosmetic only. |
+
+---
+
 ## Table of Contents
 
 1. [Architecture Overview](#1-architecture-overview)
@@ -1748,16 +1776,62 @@ An **8 GB** box is no longer ideal once Plex, monitoring, and Playwright all coe
 
 ---
 
+## Active Use Cases — What Alfred Actually Does
+
+> Live as of 2026-03-21. These are the patterns in daily use, not design aspirations.
+
+### Scheduled / Autonomous
+
+| Job | Schedule | Channel | What it does |
+|-----|----------|---------|--------------|
+| **Morning briefing** | Daily 07:30 Europe/London | Telegram | Calendar (personal + work + family), any due reminders, BTC/MSFT prices, 5 global news headlines. Under 300 words. Switches to WhatsApp DM when Baileys is live. |
+| **Vehicle reminders** | Daily 08:00 Europe/London | Telegram | Checks memory for MOT/tax/insurance due dates. Only fires at exactly 30 or 14 days out — silent otherwise. Current vehicles: BMW GS (MOT, tax), Mercedes (tax), plus insurance dates. |
+| **Job collector** | Tue + Thu 06:00 Europe/London | Silent (no output) | Scrapes AI company career pages for Solutions Engineer / Solutions Architect roles matching Vitor's profile. Appends new matches to `memory/jobs/seen.md`. See `skills/job-search/SKILL.md`. |
+| **Weekly digest** | Monday 08:00 Europe/London | Telegram | Replaces Monday morning briefing. 2-week calendar preview, OpenClaw changelog triage (Docker/Telegram/security items only), and jobs collected since last Monday. Under 500 words. |
+
+### On-Demand (Telegram)
+
+| Pattern | Skill / Tool | Notes |
+|---------|-------------|-------|
+| `"do I have X on Plex?"` / `"add X"` | `skills/media` → `media-bridge:8090` | Queries Sonarr/Radarr via internal media-bridge API. Can check status, next episode, and add new shows/movies. Never exposed to WAN. |
+| Gmail read / draft | Google Workspace skill (OAuth) | Alfred can read inbox and create drafts. Will not send directly — drafts only, Vitor confirms. |
+| Google Calendar read / write | Google Workspace skill (OAuth) | Creates and reads events on personal, work (read-only), and family calendars. |
+| Research / browsing | Playwright browser via `browser:3000` | Used for job searches, price lookups, news, career pages. All external content scanned by LLM Guard before use. |
+| Memory questions | QMD (`qmd query`) | "What did I tell you about X?" — hybrid BM25 + vector search over workspace memory files. |
+
+### Security Behaviour in Practice
+
+- All web-fetched / email content is scanned via `POST http://llm-guard:8000/analyze/prompt` before Alfred reasons over it — mandatory rule in `AGENTS.md`.
+- Prompt injection was attempted in a test ("Ignore previous instructions…") — LLM Guard returned `PromptInjection: 1.0`, Alfred refused to follow the instruction.
+- Egress is locked to the domain allowlist in `config/pipelock/pipelock.yaml` — non-allowlisted outbound calls fail silently.
+- Telegram is the only admin/mutation channel. WhatsApp (when live) will be family/approval only — no config changes or skill installs.
+
+### What Works Well
+
+- Morning briefing quality is good — calendar merge, prices, headlines all land correctly.
+- Media lookup is the most-used on-demand skill ("add Severance S3", "do I have Dune 2?").
+- Job collector + weekly digest is the highest-value automation — surfaces roles Alfred would otherwise miss.
+- Google Calendar writes are reliable; Gmail drafts work but Vitor almost always sends from the Gmail UI anyway.
+
+### What Could Be Better
+
+- MSFT price on weekends/holidays sometimes requires multiple browser retries before finding a closed-market note.
+- Job collector hits JS-rendered career pages (OpenAI, Cursor, Perplexity) that Playwright can't always parse — some companies are effectively unreachable without a dedicated scraper.
+- Briefing has no memory of what it reported yesterday — occasionally resurfaces the same news story twice.
+
+---
+
 ## Future Work / Known Gaps
 
 These items are acknowledged but intentionally deferred. They should be revisited in priority order after Phase 5 is stable.
 
 | Item | Status | Notes |
 |------|--------|-------|
-| **TLS interception for Pipelock** | Deferred | Pipelock cannot inspect HTTPS payloads without a CA cert distributed to all containers. Requires generating a local CA, baking the cert into the `openclaw`, `litellm`, `llm-guard`, `sandbox`, and `browser` images at build time, and configuring Pipelock's TLS interception mode. See Pipelock TLS interception docs. |
-| **Sophonn's Google OAuth token** | Pending | The OAuth consent flow for `sophonnkhov@gmail.com` has not been run yet. Calendar and Gmail access for Sophonn's tasks is blocked until this is done. |
-| **WhatsApp channels** | Pending giffgaff SIM | A dedicated UK number is needed to register the WhatsApp Business account via the Meta Developer Portal. Blocked on giffgaff SIM arrival and activation. |
+| **WhatsApp (Baileys)** | Blocked — phone pending | OpenClaw uses Baileys (QR scan), not Meta API. Meta credentials have been removed. A second phone is needed to host the Baileys session. When the phone arrives: enable WhatsApp in `openclaw.json`, start `openclaw`, scan the QR code, and the session persists. Allowed number `+447535113049` is already configured. |
+| **Sophonn's Google OAuth token** | Pending | The OAuth consent flow for `sophonnkhov@gmail.com` has not been run yet. Calendar and Gmail access for Sophonn's tasks is blocked until this is done. Same process as Vitor's `token_vitor.json`. |
 | **Zoho email (`assistant@bitoiu.net`)** | Parked | The Zoho Mail Lite account and DNS records for `bitoiu.net` have not been configured. The agent cannot send or receive email via this address until this is done. |
-| **LLM Guard native tool output hook** | No native hook in OpenClaw 2026.3.13 | LLM Guard currently only scans prompts and model outputs, not tool call results flowing back into the agent context. The current mitigation is behavioural guidance via `AGENTS.md`. A native hook would require a custom OpenClaw plugin or upstream SDK support. |
-| **Voice support** | Pending WhatsApp | sherpa-onnx TTS and Whisper STT containers are planned for inbound/outbound voice note handling. Deferred until WhatsApp channel is live, since Telegram voice notes are lower priority for this household. |
-| **MontanaPlanner second Telegram bot** | Parked | A dedicated Telegram bot for household planning tasks (MontanaPlanner) was discussed but not implemented. Parked until core channels are stable. |
+| **LLM Guard native integration** | ✅ Done (skill + AGENTS.md mandate) | Wired via workspace skill (`skills/llm-guard/SKILL.md`) and mandatory scanning rule in `AGENTS.md` §"Security — External Content". Alfred scans all external content via `POST http://llm-guard:8000/analyze/prompt` before incorporating it. No native request-pipeline plugin exists in 2026.3.13, but behavioural enforcement is in place and tested. |
+| **TLS interception for Pipelock** | Deferred | Pipelock cannot inspect HTTPS payloads without a CA cert distributed to all containers. Low priority given egress domain allowlisting is working. |
+| **Pipelock healthcheck fix** | ✅ Fixed 2026-03-21 | Changed from `CMD-SHELL wget` (no `/bin/sh` in image) to `CMD ["/pipelock", "healthcheck"]`. Now reports `healthy`. |
+| **Voice support** | Pending WhatsApp | sherpa-onnx TTS and Whisper STT planned for voice note handling. Deferred until WhatsApp/Baileys is live. |
+| **MontanaPlanner second Telegram bot** | Parked | A dedicated Telegram bot for household planning tasks. Parked until core channels are stable. |
