@@ -7,31 +7,33 @@
 
 ---
 
-## Deployment Status — 2026-03-21
+## Deployment Status — 2026-04-08
 
-> Last updated 2026-03-21. This section reflects actual deployed state; the rest of the document is the original design reference.
+> Last updated 2026-04-08. This section reflects actual deployed state; the rest of the document is the original design reference.
 
 ### Phase Gate Summary
 
 | Phase | Name | Status | Notes |
 |-------|------|--------|-------|
 | **0** | Host Baseline | ✅ Done | qBittorrent retired; paths created; existing stack unchanged |
-| **1** | Core Runtime | ✅ Done | All services running: `openclaw`, `litellm`, `llm-guard`, `sandbox`, `browser`, `proxy`, `pipelock`, `media-bridge`. OpenClaw healthy. |
-| **2** | Channels & Accounts | ✅ Partial | Telegram ✅, Google OAuth (Vitor) ✅, Gmail read/draft ✅, Google Calendar ✅. WhatsApp disabled pending phone — see Known Gaps. Sophonn OAuth pending. |
-| **3** | Security Controls | ✅ Done | Egress blocked via Pipelock+Squid. `openclaw.json` read-only. Security audit: **0 critical, 0 warn**. LLM Guard container running + wired via skill and AGENTS.md mandate. |
+| **1** | Core Runtime | ✅ Done | All services running: `openclaw`, `litellm`, `llm-guard`, `browser`, `proxy`, `pipelock`, `media-bridge`. OpenClaw healthy. Upgraded to **v2026.4.8** on 2026-04-08 (from v2026.4.5). Key gains: DNS pinning disabled in trusted proxy environments (fixes intermittent resolution through Pipelock/Squid), heartbeat pinned to main session (subagent transcripts no longer overwritten during cron), bundled channel shared secret loading fixes (WhatsApp), plugin compatibility metadata aligned with release version, `/exec` reporting corrected, dreaming improvements (session transcript ingestion, cursor checkpointing), Anthropic thinking blocks preserved for Claude 4.x family. New config: `compaction.model` set to `litellm/gemini-3-flash-preview` (offloads context compaction to free Flash model instead of burning Sonnet tokens). Previous v2026.4.5 gains retained: prompt cache stabilization, cron replay on restart, outbound sanitizer, `exec-approvals.json` agent security overrides, `memory-core` dreaming (3 AM daily). |
+| **2** | Channels & Accounts | ✅ Done | Telegram ✅, Google OAuth (Vitor) ✅, Gmail read/draft ✅, Google Calendar ✅, WhatsApp ✅ (Baileys, paired 2026-03-25, bot number +447591794241, family group `120363424083759964@g.us`). Sophonn OAuth pending. |
+| **3** | Security Controls | ✅ Done | Egress blocked via Pipelock+Squid. `openclaw.json` read-only. Secrets hardened 2026-03-25: Telegram token + gateway token moved to `${ENV_VAR}` refs, `secrets.providers.default.allowlist` restricts agent env access, `token_vitor.json` moved to `secrets/` with ro bind mount. LiteLLM `hide-secrets` guardrail disabled (false-positive storm on email content; secret protection handled by OpenClaw allowlist + Pipelock). LLM Guard container running + wired via skill and AGENTS.md mandate. **2026-04-06 hardening:** secrets/ dir perms tightened to 700/600, Alertmanager Gmail app password moved from plaintext YAML to `smtp_auth_password_file` with bind-mounted secret, alarm code removed from MEMORY.md into secrets env, stale Brave/Facebook domains removed from Squid+Pipelock allowlists, LiteLLM circular fallback (sonnet→pro loop) eliminated. |
 | **4** | Workspace & Persona | ✅ Done | `SOUL.md`, `AGENTS.md`, `TOOLS.md`, `HEARTBEAT.md`, `MEMORY.md`, `IDENTITY.md`, `USER.md`, `USER.private.md` all deployed. Memory indexed. Alfred responding as intended on Telegram. |
-| **5** | Operationalise | ✅ Done | `mediaserver.service` installed + enabled (systemd auto-start on boot). Watchdog script running via cron every 5 min, alerts to Telegram on container down/recovery. |
+| **5** | Operationalise | ✅ Done | `mediaserver.service` installed + enabled (systemd auto-start on boot). Watchdog script running via cron every 5 min, alerts to Telegram on container down/recovery. **2026-04-06:** Watchdog log moved to persistent `logs/watchdog.log` (was `/tmp/`, lost on reboot), added heartbeat line on each run. Grafana dashboard exported to git provisioning. Prometheus expected-services list expanded to cover all OpenClaw stack containers. Alertmanager critical alerts now repeat every 30m (was 4h for all severities). |
 
 ### Known Deviations from Original PRD
 
 | Item | PRD assumption | Reality |
 |------|---------------|---------|
-| **NVIDIA OpenShell** | Sandboxed execution via OpenShell container | Image doesn't exist as designed; using AIO Sandbox (`ghcr.io/agent-infra/sandbox`) instead |
-| **ClawSec / ClawHub** | `clawhub install clawsec-suite` | ClawHub not used; OpenClaw 2026.3.13 has native `openclaw security audit` which covers the same ground |
+| **NVIDIA OpenShell** | Sandboxed execution via OpenShell container | Using bundled OpenShell backend (`sandbox.backend: "openshell"`). Default sandbox mode restored after v2026.4.1-beta.1 fixed exec in sandboxed cron sessions. |
+| **ClawSec / ClawHub** | `clawhub install clawsec-suite` | ClawHub not used; OpenClaw 2026.3.13+ has native `openclaw security audit` which covers the same ground. v2026.3.24 adds ClawHub plugin API version regression coverage and improved uninstall handling. |
 | **LLM Guard plugin** | Wired into OpenClaw as a plugin/middleware | No native plugin exists; container runs and scans independently; integration deferred to a future skill |
-| **WhatsApp** | Meta WhatsApp Cloud API (token + phone number ID) | OpenClaw's native WhatsApp channel uses **Baileys (QR scan)**, not Meta API. Meta credentials removed. Blocked on phone arrival. |
+| **WhatsApp** | Meta WhatsApp Cloud API (token + phone number ID) | ✅ Live via Baileys (QR scan) since 2026-03-25. Bot number: +447591794241 (giffgaff). Allowlist: Vitor (+447535113049), Sophonn (+447912476134). Family group allowlisted. `ackReaction: 👀` enabled. ✅ Voice notes working since 2026-04-05 (required `*.whatsapp.net` + `api.openai.com` in Pipelock allowlist, and `transcribe.sh` in exec allowlist). |
 | **Pipelock healthcheck** | ✅ Fixed | Changed to `CMD ["/pipelock", "healthcheck"]`. Now reports healthy. |
 | **Gateway self-probe (operator.read)** | CLI self-probes gateway in `security audit --deep` | CLI inside container cannot authenticate to gateway with operator scope; probe shows as failed. Gateway is functional. Cosmetic only. |
+| **Default model** | Gemini Flash via Kilo | Changed to **Claude Sonnet 4.6** (`litellm/kilo-sonnet`) 2026-03-25. Gemini Pro/Flash leaked internal orchestration prompts into WhatsApp replies. Sonnet is more expensive but follows system prompts cleanly. Fallback chain: flash → pro → sonnet. |
+| **LiteLLM hide-secrets guardrail** | Enabled by default | Disabled 2026-03-25. Was generating 1700+ false-positive warnings per 5 minutes on email/calendar base64 content, causing multi-step tasks to timeout. Secret protection now handled by OpenClaw `secrets.providers.default.allowlist` + Pipelock egress filtering. `content-filter` guardrail remains active. |
 
 ---
 
@@ -1355,7 +1357,7 @@ Recommendation for v1:
 
 - enable QMD from day one
 - do **not** add `lossless-claw` yet
-- revisit `lossless-claw` only if long-session compaction becomes a real pain
+- revisit `lossless-claw` only if long-session compaction becomes a real pain (compaction now offloaded to free Flash model via `compaction.model` as of v2026.4.8)
 
 Concrete Docker solution:
 
@@ -1426,16 +1428,12 @@ For real-time webhooks, set up a **Tailscale Funnel** to expose a webhook endpoi
 
 ---
 
-## 15. Voice Support (Optional)
+## 15. Voice Support
 
 For a headless Docker setup, voice works through Telegram and WhatsApp voice messages:
 
-- **Inbound:** Voice notes arrive as OGG/Opus → transcribe with faster-whisper (local, ~600 MB RAM) or OpenAI Whisper API
-- **Outbound:** Piper TTS (local, ~200 MB RAM, British English voice) → upload as audio message
-
-Add as sidecar containers (see Docker Compose). Total additional RAM: ~1.5 GB.
-
-On 8 GB systems, skip these and fall back to cloud APIs for voice.
+- **Inbound (✅ Working):** Voice notes arrive as OGG/Opus → transcribed via OpenAI Whisper API (`gpt-4o-mini-transcribe`). Cloud-only, no local Whisper container needed. Requires: `*.whatsapp.net` in Pipelock allowlist (media download), `api.openai.com` in Pipelock allowlist (STT API), and `/app/skills/openai-whisper-api/scripts/transcribe.sh` in exec allowlist.
+- **Outbound (Not configured):** Piper TTS (local, ~200 MB RAM, British English voice) → upload as audio message. Or cloud TTS via OpenAI/ElevenLabs.
 
 ---
 
@@ -1827,11 +1825,11 @@ These items are acknowledged but intentionally deferred. They should be revisite
 
 | Item | Status | Notes |
 |------|--------|-------|
-| **WhatsApp (Baileys)** | Blocked — phone pending | OpenClaw uses Baileys (QR scan), not Meta API. Meta credentials have been removed. A second phone is needed to host the Baileys session. When the phone arrives: enable WhatsApp in `openclaw.json`, start `openclaw`, scan the QR code, and the session persists. Allowed number `+447535113049` is already configured. |
+| **WhatsApp (Baileys)** | ✅ Done 2026-03-25 | Paired via QR scan. Bot: +447591794241 (giffgaff). DM allowlist: Vitor, Sophonn. Group: family chat (`120363424083759964@g.us`, requireMention: true). `ackReaction: 👀`. ✅ Voice transcription working since 2026-04-05 (OpenAI `gpt-4o-mini-transcribe`). |
 | **Sophonn's Google OAuth token** | Pending | The OAuth consent flow for `sophonnkhov@gmail.com` has not been run yet. Calendar and Gmail access for Sophonn's tasks is blocked until this is done. Same process as Vitor's `token_vitor.json`. |
 | **Zoho email (`assistant@bitoiu.net`)** | Parked | The Zoho Mail Lite account and DNS records for `bitoiu.net` have not been configured. The agent cannot send or receive email via this address until this is done. |
 | **LLM Guard native integration** | ✅ Done (skill + AGENTS.md mandate) | Wired via workspace skill (`skills/llm-guard/SKILL.md`) and mandatory scanning rule in `AGENTS.md` §"Security — External Content". Alfred scans all external content via `POST http://llm-guard:8000/analyze/prompt` before incorporating it. No native request-pipeline plugin exists in 2026.3.13, but behavioural enforcement is in place and tested. |
 | **TLS interception for Pipelock** | Deferred | Pipelock cannot inspect HTTPS payloads without a CA cert distributed to all containers. Low priority given egress domain allowlisting is working. |
 | **Pipelock healthcheck fix** | ✅ Fixed 2026-03-21 | Changed from `CMD-SHELL wget` (no `/bin/sh` in image) to `CMD ["/pipelock", "healthcheck"]`. Now reports `healthy`. |
-| **Voice support** | Pending WhatsApp | sherpa-onnx TTS and Whisper STT planned for voice note handling. Deferred until WhatsApp/Baileys is live. |
+| **Voice support** | ✅ Inbound done 2026-04-05 | Inbound transcription working (OpenAI `gpt-4o-mini-transcribe`, `echoTranscript: true`). Fix required: `*.whatsapp.net` + `api.openai.com` added to Pipelock allowlist (media download + STT API), `transcribe.sh` added to exec allowlist. Outbound TTS not configured. |
 | **MontanaPlanner second Telegram bot** | Parked | A dedicated Telegram bot for household planning tasks. Parked until core channels are stable. |
